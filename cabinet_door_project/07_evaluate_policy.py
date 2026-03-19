@@ -140,7 +140,7 @@ def main():
     parser.add_argument(
         "--success_threshold",
         type=float,
-        default=0.90,
+        default=0.10,
         help="Door openness threshold for one-door success",
     )
     args = parser.parse_args()

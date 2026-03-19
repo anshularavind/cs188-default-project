@@ -1,0 +1,41 @@
+seed: 42
+epochs: 100
+batch_size: 128
+learning_rate: 0.001
+weight_decay: 0.000001
+num_workers: 0
+grad_clip: 1.0
+log_every: 1
+checkpoint_dir: /tmp/cabinet_temporal_unet_bc_working_ckpts
+max_episodes: null
+
+include_augmented: true
+require_augmented: true
+include_all_lowdim: false
+use_observation_state: true
+state_keys_override:
+  - observation.state
+  - observation.handle_pos
+  - observation.handle_to_eef_pos
+expected_state_dim: 22
+
+horizon: 16
+n_obs_steps: 16
+n_action_steps: 8
+steps_per_epoch: 0
+episode_burn_in_steps: 0
+val_split_ratio: 0.15
+min_val_episodes: 1
+early_stopping_patience: 25
+early_stopping_min_delta: 0.0001
+use_amp: true
+
+base_channels: 64
+channel_mults: [1, 2]
+num_res_blocks: 1
+time_emb_dim: 128
+cond_dim: 256
+dropout: 0.0
+
+l1_weight: 0.10
+velocity_weight: 0.10

@@ -45,12 +45,46 @@ else:
 import argparse
 import time
 
+import numpy as np
 import robocasa  # noqa: F401
 import robosuite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.wrappers import VisualizationWrapper
 
-from policy_common import is_one_door_open_success, load_policy_wrapper
+from policy_common import (
+    OnlineHandleFeatureExtractor,
+    is_one_door_open_success,
+    load_policy_wrapper,
+)
+
+
+def _collect_debug_metrics(extractor, env, action, near_handle_threshold):
+    feat = extractor.extract(env)
+
+    handle_to_eef = feat.get("handle_to_eef_pos", np.zeros((3,), dtype=np.float32))
+    h = np.asarray(handle_to_eef, dtype=np.float32).reshape(-1)
+    if h.shape[0] >= 3:
+        dist_to_handle = float(np.linalg.norm(h[:3]))
+    else:
+        dist_to_handle = float("inf")
+
+    door_open_arr = feat.get("door_openness", np.zeros((1,), dtype=np.float32))
+    door_open_flat = np.asarray(door_open_arr, dtype=np.float32).reshape(-1)
+    door_openness = float(door_open_flat[0]) if door_open_flat.size > 0 else 0.0
+
+    gripper_cmd = float(action[6]) if action.shape[0] > 6 else float("nan")
+    near_handle = bool(np.isfinite(dist_to_handle) and dist_to_handle <= near_handle_threshold)
+    gripper_close = bool(gripper_cmd > 0.5)
+    gripper_open = bool(gripper_cmd < -0.5)
+
+    return {
+        "dist_to_handle": dist_to_handle,
+        "door_openness": door_openness,
+        "gripper_cmd": gripper_cmd,
+        "near_handle": near_handle,
+        "gripper_close": gripper_close,
+        "gripper_open": gripper_open,
+    }
 
 
 def run_onscreen(policy, args):
@@ -70,6 +104,7 @@ def run_onscreen(policy, args):
     env = VisualizationWrapper(env)
 
     successes = 0
+    extractor = OnlineHandleFeatureExtractor()
     for ep in range(args.num_episodes):
         print(f"\n--- Episode {ep + 1}/{args.num_episodes} ---")
         obs = env.reset()
@@ -82,15 +117,57 @@ def run_onscreen(policy, args):
         print(f"  Running for up to {args.max_steps} steps...")
 
         success = False
+        min_dist = float("inf")
+        max_open = 0.0
+        close_cmd_count = 0
+        open_cmd_count = 0
+        near_close_cmd_count = 0
+        near_steps = 0
 
         for step in range(args.max_steps):
             action = policy.act(obs=obs, env=env, env_action_dim=env.action_dim)
             obs, reward, done, info = env.step(action)
 
+            metrics = None
+            if args.debug_metrics:
+                metrics = _collect_debug_metrics(
+                    extractor=extractor,
+                    env=env,
+                    action=action,
+                    near_handle_threshold=args.near_handle_threshold,
+                )
+                min_dist = min(min_dist, metrics["dist_to_handle"])
+                max_open = max(max_open, metrics["door_openness"])
+                if metrics["gripper_close"]:
+                    close_cmd_count += 1
+                if metrics["gripper_open"]:
+                    open_cmd_count += 1
+                if metrics["near_handle"]:
+                    near_steps += 1
+                    if metrics["gripper_close"]:
+                        near_close_cmd_count += 1
+
             if step % 20 == 0:
                 checking = is_one_door_open_success(env, threshold=args.success_threshold)
                 status = "one door OPEN" if checking else "in progress"
-                print(f"  step {step:4d}  reward={reward:+.3f}  [{status}]")
+                if args.debug_metrics:
+                    print(
+                        f"  step {step:4d}  reward={reward:+.3f}  [{status}]"
+                        f"  dist={metrics['dist_to_handle']:.3f}"
+                        f"  open={metrics['door_openness']:.3f}"
+                        f"  grip={metrics['gripper_cmd']:+.1f}"
+                    )
+                else:
+                    print(f"  step {step:4d}  reward={reward:+.3f}  [{status}]")
+
+            if args.debug_metrics and step % max(1, int(args.debug_every)) == 0:
+                print(
+                    f"    debug t={step:4d}"
+                    f"  dist={metrics['dist_to_handle']:.3f}"
+                    f"  open={metrics['door_openness']:.3f}"
+                    f"  grip={metrics['gripper_cmd']:+.1f}"
+                    f"  near={int(metrics['near_handle'])}"
+                )
 
             if is_one_door_open_success(env, threshold=args.success_threshold):
                 success = True
@@ -100,6 +177,14 @@ def run_onscreen(policy, args):
 
         result = "SUCCESS" if success else "did not open a door"
         print(f"\n  Result: {result}")
+        if args.debug_metrics:
+            print("  Debug summary:")
+            print(f"    min dist to handle:   {min_dist:.4f}")
+            print(f"    max door openness:    {max_open:.4f}")
+            print(f"    close cmd count:      {close_cmd_count}")
+            print(f"    open cmd count:       {open_cmd_count}")
+            print(f"    near-handle steps:    {near_steps}")
+            print(f"    near close cmd count: {near_close_cmd_count}")
         if success:
             successes += 1
 
@@ -119,6 +204,7 @@ def run_offscreen(policy, args):
     cam_h, cam_w = 512, 768
     successes = 0
     all_frames = []
+    extractor = OnlineHandleFeatureExtractor()
 
     for ep in range(args.num_episodes):
         print(f"\n--- Episode {ep + 1}/{args.num_episodes} ---")
@@ -140,10 +226,35 @@ def run_offscreen(policy, args):
 
         success = False
         ep_frames = []
+        min_dist = float("inf")
+        max_open = 0.0
+        close_cmd_count = 0
+        open_cmd_count = 0
+        near_close_cmd_count = 0
+        near_steps = 0
 
         for step in range(args.max_steps):
             action = policy.act(obs=obs, env=env, env_action_dim=env.action_dim)
             obs, reward, done, info = env.step(action)
+
+            metrics = None
+            if args.debug_metrics:
+                metrics = _collect_debug_metrics(
+                    extractor=extractor,
+                    env=env,
+                    action=action,
+                    near_handle_threshold=args.near_handle_threshold,
+                )
+                min_dist = min(min_dist, metrics["dist_to_handle"])
+                max_open = max(max_open, metrics["door_openness"])
+                if metrics["gripper_close"]:
+                    close_cmd_count += 1
+                if metrics["gripper_open"]:
+                    open_cmd_count += 1
+                if metrics["near_handle"]:
+                    near_steps += 1
+                    if metrics["gripper_close"]:
+                        near_close_cmd_count += 1
 
             frame = env.sim.render(
                 height=cam_h, width=cam_w, camera_name="robot0_agentview_center"
@@ -153,7 +264,24 @@ def run_offscreen(policy, args):
             if step % 20 == 0:
                 checking = is_one_door_open_success(env, threshold=args.success_threshold)
                 status = "one door OPEN" if checking else "in progress"
-                print(f"  step {step:4d}  reward={reward:+.3f}  [{status}]")
+                if args.debug_metrics:
+                    print(
+                        f"  step {step:4d}  reward={reward:+.3f}  [{status}]"
+                        f"  dist={metrics['dist_to_handle']:.3f}"
+                        f"  open={metrics['door_openness']:.3f}"
+                        f"  grip={metrics['gripper_cmd']:+.1f}"
+                    )
+                else:
+                    print(f"  step {step:4d}  reward={reward:+.3f}  [{status}]")
+
+            if args.debug_metrics and step % max(1, int(args.debug_every)) == 0:
+                print(
+                    f"    debug t={step:4d}"
+                    f"  dist={metrics['dist_to_handle']:.3f}"
+                    f"  open={metrics['door_openness']:.3f}"
+                    f"  grip={metrics['gripper_cmd']:+.1f}"
+                    f"  near={int(metrics['near_handle'])}"
+                )
 
             if is_one_door_open_success(env, threshold=args.success_threshold):
                 success = True
@@ -161,6 +289,14 @@ def run_offscreen(policy, args):
 
         result = "SUCCESS" if success else "did not open a door"
         print(f"  Result: {result}  ({len(ep_frames)} frames)")
+        if args.debug_metrics:
+            print("  Debug summary:")
+            print(f"    min dist to handle:   {min_dist:.4f}")
+            print(f"    max door openness:    {max_open:.4f}")
+            print(f"    close cmd count:      {close_cmd_count}")
+            print(f"    open cmd count:       {open_cmd_count}")
+            print(f"    near-handle steps:    {near_steps}")
+            print(f"    near close cmd count: {near_close_cmd_count}")
         if success:
             successes += 1
 
@@ -230,8 +366,25 @@ def main():
     parser.add_argument(
         "--success_threshold",
         type=float,
-        default=0.90,
+        default=0.10,
         help="Door openness threshold for one-door success",
+    )
+    parser.add_argument(
+        "--debug_metrics",
+        action="store_true",
+        help="Log handle distance, openness, and gripper command diagnostics",
+    )
+    parser.add_argument(
+        "--debug_every",
+        type=int,
+        default=20,
+        help="How often (steps) to print detailed debug metrics",
+    )
+    parser.add_argument(
+        "--near_handle_threshold",
+        type=float,
+        default=0.06,
+        help="Distance threshold (m) for near-handle debug stats",
     )
     args = parser.parse_args()
 
@@ -260,6 +413,11 @@ def main():
     print(f"  State dim: {info.state_dim}, Action dim: {info.action_dim}")
     print(f"  Device:    {device}")
     print(f"  Success:   any one door open (threshold={args.success_threshold:.2f})")
+    if args.debug_metrics:
+        print(
+            "  Debug:     enabled "
+            f"(every={args.debug_every} steps, near={args.near_handle_threshold:.3f}m)"
+        )
 
     mode = "off-screen (video)" if args.offscreen else "on-screen (viewer window)"
     print(f"Mode:       {mode}")

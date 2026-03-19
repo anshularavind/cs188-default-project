@@ -31,6 +31,21 @@ def run_apt_install(packages: list[str]):
     run(prefix + ["apt-get", "install", "-y"] + packages)
 
 
+def apt_has_candidate(package: str) -> bool:
+    proc = subprocess.run(
+        ["apt-cache", "policy", package],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Candidate:"):
+            return "(none)" not in line
+    return False
+
+
 def pip_install(args: list[str]):
     run([sys.executable, "-m", "pip", "install"] + args)
 
@@ -100,17 +115,20 @@ def main():
     print(f"Repo root: {repo_root}")
 
     if not args.skip_apt:
-        run_apt_install(
-            [
-                "git",
-                "ffmpeg",
-                "libgl1",
-                "libglew2.2",
-                "libosmesa6",
-                "python3-dev",
-                "build-essential",
-            ]
-        )
+        packages = ["git", "ffmpeg", "libosmesa6", "python3-dev", "build-essential"]
+        if apt_has_candidate("libgl1"):
+            packages.append("libgl1")
+        elif apt_has_candidate("libgl1-mesa-glx"):
+            packages.append("libgl1-mesa-glx")
+
+        if apt_has_candidate("libglew2.2"):
+            packages.append("libglew2.2")
+        elif apt_has_candidate("libglew2.1"):
+            packages.append("libglew2.1")
+        elif apt_has_candidate("libglew-dev"):
+            packages.append("libglew-dev")
+
+        run_apt_install(packages)
 
     pip_install(["--upgrade", "pip", "setuptools", "wheel"])
 
