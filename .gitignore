@@ -19,3 +19,5 @@ MUJOCO_LOG.TXT
 
 # Lock files
 uv.lock
+
+cabinet_door_project/diffusion_ckpts/
