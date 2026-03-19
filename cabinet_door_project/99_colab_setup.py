@@ -35,6 +35,16 @@ def pip_install(args: list[str]):
     run([sys.executable, "-m", "pip", "install"] + args)
 
 
+def ensure_torch():
+    try:
+        import torch  # noqa: F401
+        return
+    except Exception:
+        pass
+    # Colab usually has torch preinstalled; install only if missing.
+    pip_install(["torch", "torchvision"])
+
+
 def ensure_repo(repo_root: Path):
     rs_dir = repo_root / "robosuite"
     rc_dir = repo_root / "robocasa"
@@ -64,6 +74,11 @@ def main():
         "--download_assets",
         action="store_true",
         help="Download RoboCasa kitchen assets after install",
+    )
+    parser.add_argument(
+        "--setup_macros",
+        action="store_true",
+        help="Run RoboCasa macro setup after install",
     )
     parser.add_argument(
         "--download_dataset",
@@ -101,6 +116,8 @@ def main():
 
     rs_dir, rc_dir = ensure_repo(repo_root)
 
+    ensure_torch()
+
     # Core project dependencies.
     pip_install(["-e", str(rs_dir)])
     pip_install(["-e", str(rc_dir)])
@@ -112,6 +129,10 @@ def main():
         "imageio-ffmpeg",
         "gymnasium",
         "termcolor",
+        "opencv-python-headless>=4.10",
+        "matplotlib",
+        "pyopengl",
+        "pyopengl-accelerate",
     ])
 
     # Colab-friendly default for offscreen MuJoCo.
@@ -119,7 +140,10 @@ def main():
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
     if args.download_assets:
-        run([sys.executable, "-m", "robocasa.scripts.download_kitchen_assets"])
+        run([sys.executable, str(rc_dir / "robocasa" / "scripts" / "download_kitchen_assets.py")])
+
+    if args.setup_macros:
+        run([sys.executable, str(rc_dir / "robocasa" / "scripts" / "setup_macros.py")])
 
     if args.download_dataset:
         run([sys.executable, str(repo_root / "cabinet_door_project" / "04_download_dataset.py")])

@@ -84,6 +84,26 @@ def _safe_torch_load(path: str, device: torch.device):
         return torch.load(path, map_location=device)
 
 
+def _unwrap_model_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Normalize checkpoint state dict keys.
+
+    Older diffusion checkpoints may save DiffusionPolicyCore.state_dict(), which
+    prefixes all U-Net keys with "model.". This helper strips that prefix when
+    present so we can load into ConditionalUnet1D directly.
+    """
+    if not isinstance(state_dict, dict) or not state_dict:
+        return state_dict
+
+    if any(k.startswith("model.") for k in state_dict.keys()):
+        stripped = {
+            k[len("model.") :]: v for k, v in state_dict.items() if k.startswith("model.")
+        }
+        if stripped:
+            return stripped
+    return state_dict
+
+
 def _sort_numeric_suffix(cols: Iterable[str], prefix: str) -> List[str]:
     def key_fn(name: str):
         suffix = name[len(prefix) :]
@@ -133,12 +153,14 @@ def infer_state_columns(
     column_names: Sequence[str],
     include_augmented: bool = True,
     include_all_lowdim: bool = False,
+    use_observation_state: bool = True,
 ) -> List[str]:
     """Infer which parquet columns should form the low-dimensional policy state."""
     cols = list(column_names)
     state_cols: List[str] = []
 
-    if "observation.state" in cols:
+    use_packed_state = bool(use_observation_state and "observation.state" in cols)
+    if use_packed_state:
         state_cols.append("observation.state")
 
     if include_augmented:
@@ -146,26 +168,34 @@ def infer_state_columns(
             if k in cols:
                 state_cols.append(k)
 
+    excluded = set(state_cols)
+    if not use_observation_state:
+        excluded.add("observation.state")
+
     if include_all_lowdim:
         lowdim_cols = [
             c
             for c in cols
-            if c.startswith("observation.") and "image" not in c and c not in state_cols
+            if c.startswith("observation.") and "image" not in c and c not in excluded
         ]
         state_cols.extend(sorted(lowdim_cols))
-    elif "observation.state" not in cols:
+    elif not use_packed_state:
         # If no packed state column exists, include all low-dim observation keys.
         lowdim_cols = sorted(
             c
             for c in cols
-            if c.startswith("observation.") and "image" not in c and c not in state_cols
+            if c.startswith("observation.") and "image" not in c and c not in excluded
         )
         state_cols = lowdim_cols + [c for c in state_cols if c not in lowdim_cols]
 
     if not state_cols:
         # Fallback when observation.state is absent: use all non-image observation keys.
         state_cols = sorted(
-            c for c in cols if c.startswith("observation.") and "image" not in c
+            c
+            for c in cols
+            if c.startswith("observation.")
+            and "image" not in c
+            and (use_observation_state or c != "observation.state")
         )
 
     return state_cols
@@ -225,6 +255,12 @@ class CabinetSequenceDataset(torch.utils.data.Dataset):
     Each sample provides:
       obs_seq:     [n_obs_steps, state_dim]
       action_seq:  [horizon, action_dim]
+      phase:       int64 scalar  (0=approach, 1=grasp, 2=pull)
+
+    Phase labels are derived automatically from handle distance and door openness:
+      phase 0: dist_to_handle  > phase_approach_dist
+      phase 1: dist_to_handle <= phase_approach_dist AND openness < phase_grasp_openness
+      phase 2: door openness  >= phase_grasp_openness
     """
 
     def __init__(
@@ -234,7 +270,10 @@ class CabinetSequenceDataset(torch.utils.data.Dataset):
         n_obs_steps: int,
         include_augmented: bool = True,
         include_all_lowdim: bool = False,
+        use_observation_state: bool = True,
         max_episodes: Optional[int] = None,
+        phase_approach_dist: float = 0.10,
+        phase_grasp_openness: float = 0.05,
     ):
         super().__init__()
 
@@ -247,6 +286,8 @@ class CabinetSequenceDataset(torch.utils.data.Dataset):
 
         self.horizon = int(horizon)
         self.n_obs_steps = int(n_obs_steps)
+        self.phase_approach_dist = float(phase_approach_dist)
+        self.phase_grasp_openness = float(phase_grasp_openness)
 
         parquet_files, source = discover_parquet_files(
             dataset_path=dataset_path,
@@ -263,6 +304,7 @@ class CabinetSequenceDataset(torch.utils.data.Dataset):
             first_table.column_names,
             include_augmented=include_augmented,
             include_all_lowdim=include_all_lowdim,
+            use_observation_state=use_observation_state,
         )
         action_cols = infer_action_columns(first_table.column_names)
 
@@ -274,9 +316,19 @@ class CabinetSequenceDataset(torch.utils.data.Dataset):
 
         self.episodes_states: List[np.ndarray] = []
         self.episodes_actions: List[np.ndarray] = []
+        self.episodes_phases: List[np.ndarray] = []
+
+        # Phase feature columns — read from parquet even if not in state_cols.
+        _phase_cols = ["observation.handle_to_eef_pos", "observation.door_openness"]
+        _all_col_names = set(first_table.column_names)
+        extra_phase_cols = [
+            c for c in _phase_cols
+            if c in _all_col_names and c not in state_cols and c not in action_cols
+        ]
 
         for pf in parquet_files:
-            table = pq.read_table(pf, columns=list(set(state_cols + action_cols)))
+            read_cols = list(set(state_cols + action_cols + extra_phase_cols))
+            table = pq.read_table(pf, columns=read_cols)
             df = table.to_pandas()
             if len(df) == 0:
                 continue
@@ -306,8 +358,29 @@ class CabinetSequenceDataset(torch.utils.data.Dataset):
             if len(state_arr) < min_len:
                 continue
 
+            # --- Phase labeling ---
+            n = len(state_arr)
+            if "observation.handle_to_eef_pos" in df.columns:
+                h2e, _ = series_to_2d(df["observation.handle_to_eef_pos"])
+                dists = np.linalg.norm(h2e[:n, :min(3, h2e.shape[1])], axis=1)
+            else:
+                dists = np.full(n, float("inf"), dtype=np.float32)
+
+            if "observation.door_openness" in df.columns:
+                open_arr, _ = series_to_2d(df["observation.door_openness"])
+                openness = open_arr[:n, 0]
+            else:
+                openness = np.zeros(n, dtype=np.float32)
+
+            phases = np.zeros(n, dtype=np.int64)
+            phases[
+                (dists <= self.phase_approach_dist) & (openness < self.phase_grasp_openness)
+            ] = 1
+            phases[openness >= self.phase_grasp_openness] = 2
+
             self.episodes_states.append(state_arr)
             self.episodes_actions.append(action_arr)
+            self.episodes_phases.append(phases)
 
         if not self.episodes_states:
             raise RuntimeError(
@@ -353,13 +426,16 @@ class CabinetSequenceDataset(torch.utils.data.Dataset):
         ep_idx, t = self.sample_index[idx]
         states = self.episodes_states[ep_idx]
         actions = self.episodes_actions[ep_idx]
+        phases = self.episodes_phases[ep_idx]
 
         obs_seq = states[t - self.n_obs_steps + 1 : t + 1]
         action_seq = actions[t : t + self.horizon]
+        phase = int(phases[t])
 
         return (
             torch.from_numpy(obs_seq.astype(np.float32, copy=False)),
             torch.from_numpy(action_seq.astype(np.float32, copy=False)),
+            torch.tensor(phase, dtype=torch.long),
         )
 
 
@@ -453,12 +529,13 @@ class ConditionalUnet1D(nn.Module):
         state_dim: int,
         n_obs_steps: int,
         horizon: int,
-        base_channels: int = 128,
-        channel_mults: Sequence[int] = (1, 2, 4),
-        num_res_blocks: int = 2,
+        base_channels: int = 64,
+        channel_mults: Sequence[int] = (1, 2),
+        num_res_blocks: int = 1,
         time_emb_dim: int = 128,
-        cond_dim: int = 512,
+        cond_dim: int = 256,
         dropout: float = 0.0,
+        num_phases: int = 1,
     ):
         super().__init__()
 
@@ -466,6 +543,7 @@ class ConditionalUnet1D(nn.Module):
         self.state_dim = int(state_dim)
         self.n_obs_steps = int(n_obs_steps)
         self.horizon = int(horizon)
+        self.num_phases = int(num_phases)
 
         self.time_emb = SinusoidalPosEmb(time_emb_dim)
         self.time_mlp = nn.Sequential(
@@ -478,6 +556,10 @@ class ConditionalUnet1D(nn.Module):
             nn.SiLU(),
             nn.Linear(cond_dim, cond_dim),
         )
+        # Phase embedding: learned vector per stage added to the conditioning.
+        # Only created when num_phases > 1 so old checkpoints load unchanged.
+        if self.num_phases > 1:
+            self.phase_emb = nn.Embedding(self.num_phases, cond_dim)
 
         self.init_conv = nn.Conv1d(self.action_dim, base_channels, kernel_size=3, padding=1)
 
@@ -556,18 +638,22 @@ class ConditionalUnet1D(nn.Module):
         noisy_action: torch.Tensor,
         timesteps: torch.Tensor,
         obs_seq: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             noisy_action: [B, horizon, action_dim]
             timesteps:    [B]
             obs_seq:      [B, n_obs_steps, state_dim]
+            phase:        [B] long, optional — 0=approach, 1=grasp, 2=pull
         Returns:
             predicted_noise: [B, horizon, action_dim]
         """
         cond_t = self.time_mlp(self.time_emb(timesteps))
         cond_obs = self.obs_mlp(obs_seq.reshape(obs_seq.shape[0], -1))
         cond = cond_t + cond_obs
+        if phase is not None and hasattr(self, "phase_emb"):
+            cond = cond + self.phase_emb(phase.long())
 
         x = noisy_action.transpose(1, 2)
         x = self.init_conv(x)
@@ -686,13 +772,20 @@ class DiffusionPolicyCore(nn.Module):
     def horizon(self) -> int:
         return self.model.horizon
 
-    def forward(self, noisy_action: torch.Tensor, timesteps: torch.Tensor, obs_seq: torch.Tensor):
-        return self.model(noisy_action, timesteps, obs_seq)
+    def forward(
+        self,
+        noisy_action: torch.Tensor,
+        timesteps: torch.Tensor,
+        obs_seq: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
+    ):
+        return self.model(noisy_action, timesteps, obs_seq, phase=phase)
 
     @torch.no_grad()
     def sample(
         self,
         obs_seq: torch.Tensor,
+        phase: Optional[torch.Tensor] = None,
         num_inference_steps: Optional[int] = None,
         deterministic: bool = True,
     ) -> torch.Tensor:
@@ -709,13 +802,12 @@ class DiffusionPolicyCore(nn.Module):
         if num_inference_steps is None or num_inference_steps >= n_train:
             timesteps = list(range(n_train - 1, -1, -1))
         else:
-            # Uniformly subsample training diffusion steps.
             t = np.linspace(n_train - 1, 0, num_inference_steps, dtype=np.int64)
             timesteps = [int(x) for x in t.tolist()]
 
         for t in timesteps:
             t_batch = torch.full((bsz,), t, device=device, dtype=torch.long)
-            pred_noise = self.model(sample, t_batch, obs_seq)
+            pred_noise = self.model(sample, t_batch, obs_seq, phase=phase)
             sample = self.scheduler.step(
                 pred_noise=pred_noise,
                 timestep=t,
@@ -744,6 +836,39 @@ class SimplePolicyNet(nn.Module):
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.net(state)
+
+
+class StageConditionedBCNet(nn.Module):
+    """Phase-conditioned BC network with separate heads for approach / grasp / pull."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 256,
+        num_phases: int = 3,
+    ):
+        super().__init__()
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.num_phases = int(num_phases)
+
+        self.trunk = nn.Sequential(
+            nn.Linear(self.state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.heads = nn.ModuleList(
+            [nn.Sequential(nn.Linear(hidden_dim, self.action_dim), nn.Tanh()) for _ in range(self.num_phases)]
+        )
+
+    def forward(self, state: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+        x = self.trunk(state)
+        phase = phase.long().view(-1)
+        outputs = torch.stack([head(x) for head in self.heads], dim=1)  # [B, P, A]
+        idx = phase.view(-1, 1, 1).expand(-1, 1, self.action_dim)
+        return outputs.gather(1, idx).squeeze(1)
 
 
 # -----------------------------------------------------------------------------
@@ -1059,6 +1184,25 @@ class BasePolicyWrapper:
         raise NotImplementedError
 
 
+def _find_state_slice(
+    state_keys: Optional[Sequence[str]],
+    state_key_dims: Optional[Dict[str, int]],
+    target_keys: Sequence[str],
+) -> Optional[slice]:
+    if not state_keys or not state_key_dims:
+        return None
+
+    targets = set(target_keys)
+    offset = 0
+    for key in state_keys:
+        dim = int(state_key_dims.get(key, 0))
+        stripped = key[len("observation.") :] if key.startswith("observation.") else key
+        if key in targets or stripped in targets:
+            return slice(offset, offset + dim)
+        offset += dim
+    return None
+
+
 class SimplePolicyWrapper(BasePolicyWrapper):
     def __init__(
         self,
@@ -1092,6 +1236,164 @@ class SimplePolicyWrapper(BasePolicyWrapper):
         return pad_or_trim(action.astype(np.float32, copy=False), env_action_dim)
 
 
+class StagedBCPolicyWrapper(BasePolicyWrapper):
+    """
+    Runtime controller with explicit phases:
+    0 = approach handle, 1 = close gripper, 2 = pull.
+    """
+
+    def __init__(
+        self,
+        model: StageConditionedBCNet,
+        device: torch.device,
+        state_dim: int,
+        action_dim: int,
+        state_keys: Sequence[str],
+        state_key_dims: Dict[str, int],
+        state_mean: np.ndarray,
+        state_std: np.ndarray,
+        action_mean: np.ndarray,
+        action_std: np.ndarray,
+        approach_dist_threshold: float,
+        reapproach_dist_threshold: float,
+        grasp_steps: int,
+        gripper_close_value: float,
+    ):
+        super().__init__(state_dim, action_dim, state_keys, state_key_dims)
+        self.model = model
+        self.device = device
+        self.handle_extractor = OnlineHandleFeatureExtractor()
+
+        self.state_mean = state_mean.astype(np.float32)
+        self.state_std = np.clip(state_std.astype(np.float32), 1e-3, None)
+        self.action_mean = action_mean.astype(np.float32)
+        self.action_std = np.clip(action_std.astype(np.float32), 1e-3, None)
+
+        self.approach_dist_threshold = float(approach_dist_threshold)
+        self.reapproach_dist_threshold = float(reapproach_dist_threshold)
+        self.grasp_steps = int(max(grasp_steps, 1))
+        self.gripper_close_value = float(gripper_close_value)
+
+        self.handle_to_eef_slice = _find_state_slice(
+            self.state_keys,
+            self.state_key_dims,
+            ["observation.handle_to_eef_pos", "handle_to_eef_pos"],
+        )
+        self.door_openness_slice = _find_state_slice(
+            self.state_keys,
+            self.state_key_dims,
+            ["observation.door_openness", "door_openness"],
+        )
+
+        self.phase = 0
+        self.grasp_countdown = 0
+        self.prev_action: Optional[np.ndarray] = None
+
+    def reset(self):
+        self.phase = 0
+        self.grasp_countdown = 0
+        self.prev_action = None
+
+    def _get_action_bounds(self, env, env_action_dim: int) -> Tuple[np.ndarray, np.ndarray]:
+        low = np.full((env_action_dim,), -1.0, dtype=np.float32)
+        high = np.full((env_action_dim,), 1.0, dtype=np.float32)
+
+        spec = getattr(env, "action_spec", None)
+        if spec is not None:
+            try:
+                spec_low, spec_high = spec
+                low_arr = flatten_value(spec_low)
+                high_arr = flatten_value(spec_high)
+                if low_arr is not None and high_arr is not None:
+                    low = pad_or_trim(low_arr.astype(np.float32, copy=False), env_action_dim)
+                    high = pad_or_trim(high_arr.astype(np.float32, copy=False), env_action_dim)
+                    lo = np.minimum(low, high)
+                    hi = np.maximum(low, high)
+                    low, high = lo, hi
+            except Exception:
+                pass
+
+        return low, high
+
+    def _extract_dist_and_openness(self, state: np.ndarray) -> Tuple[float, float, Optional[np.ndarray]]:
+        dist = float("inf")
+        handle_to_eef = None
+        if self.handle_to_eef_slice is not None:
+            h = state[self.handle_to_eef_slice]
+            if h.shape[0] >= 3:
+                handle_to_eef = h[:3].astype(np.float32, copy=False)
+                dist = float(np.linalg.norm(handle_to_eef))
+
+        openness = 0.0
+        if self.door_openness_slice is not None:
+            o = state[self.door_openness_slice]
+            if o.shape[0] > 0:
+                openness = float(o[0])
+
+        return dist, openness, handle_to_eef
+
+    def _update_phase(self, dist: float):
+        if np.isfinite(dist) and dist > self.reapproach_dist_threshold:
+            self.phase = 0
+            self.grasp_countdown = 0
+            return
+
+        if self.phase == 0:
+            if np.isfinite(dist) and dist <= self.approach_dist_threshold:
+                self.phase = 1
+                self.grasp_countdown = self.grasp_steps
+            return
+
+        if self.phase == 1:
+            self.grasp_countdown -= 1
+            if self.grasp_countdown <= 0:
+                self.phase = 2
+
+    def act(self, obs: Dict[str, np.ndarray], env, env_action_dim: int) -> np.ndarray:
+        state = build_state_vector(
+            obs=obs,
+            state_keys=self.state_keys,
+            state_key_dims=self.state_key_dims,
+            state_dim=self.state_dim,
+            env=env,
+            handle_extractor=self.handle_extractor,
+        )
+        dist, openness, handle_to_eef = self._extract_dist_and_openness(state)
+        self._update_phase(dist)
+
+        state_norm = (state - self.state_mean) / self.state_std
+        s = torch.from_numpy(state_norm).unsqueeze(0).to(self.device)
+        p = torch.tensor([self.phase], dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            action_norm = self.model(s, p).cpu().numpy().squeeze(0)
+        action = action_norm * self.action_std + self.action_mean
+        action = pad_or_trim(action.astype(np.float32, copy=False), env_action_dim)
+
+        # Mild geometric attractor during approach for more direct handle targeting.
+        if self.phase == 0 and handle_to_eef is not None and action.shape[0] >= 3:
+            attract = np.clip(0.8 * handle_to_eef, -0.10, 0.10)
+            action[:3] = 0.65 * action[:3] + 0.35 * attract
+
+        # During grasp phase, force persistent close command on the gripper axis.
+        if self.phase == 1 and action.shape[0] >= 7:
+            action[6] = self.gripper_close_value
+
+        if self.prev_action is not None and self.prev_action.shape == action.shape:
+            delta = action - self.prev_action
+            if action.shape[0] >= 3:
+                delta[:3] = np.clip(delta[:3], -0.08, 0.08)
+            if action.shape[0] >= 6:
+                delta[3:6] = np.clip(delta[3:6], -0.18, 0.18)
+            if action.shape[0] >= 7:
+                delta[6:] = np.clip(delta[6:], -0.35, 0.35)
+            action = self.prev_action + delta
+
+        low, high = self._get_action_bounds(env, env_action_dim)
+        action = np.clip(np.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0), low, high)
+        self.prev_action = action.astype(np.float32, copy=True)
+        return self.prev_action
+
+
 class DiffusionPolicyWrapper(BasePolicyWrapper):
     def __init__(
         self,
@@ -1119,16 +1421,33 @@ class DiffusionPolicyWrapper(BasePolicyWrapper):
         self.action_std = np.clip(action_std.astype(np.float32), 1e-3, None)
 
         self.n_obs_steps = int(n_obs_steps)
-        self.n_action_steps = int(n_action_steps)
+        # Keep eval more closed-loop to reduce compounding instability.
+        self.n_action_steps = max(1, min(int(n_action_steps), 2))
         self.num_inference_steps = int(num_inference_steps)
 
         self.obs_history: deque[np.ndarray] = deque(maxlen=self.n_obs_steps)
         self.action_queue: deque[np.ndarray] = deque()
         self.handle_extractor = OnlineHandleFeatureExtractor()
+        self.prev_action: Optional[np.ndarray] = None
+        # Set by StagedDiffusionPolicyWrapper before each act() call so the
+        # correct phase embedding is passed to policy.sample().
+        self.current_phase: Optional[int] = None
+
+        # Conservative action smoothing to prevent violent rotational flips.
+        self.rotation_scale = 0.35
+        self.max_delta_xyz = 0.06
+        self.max_delta_rot = 0.12
+        self.max_delta_gripper = 0.25
+
+        # Mild geometric assist for faster handle approach.
+        self.handle_assist_strength = 0.30
+        self.handle_assist_max_xyz = 0.08
+        self.handle_assist_dist_scale = 0.25
 
     def reset(self):
         self.obs_history.clear()
         self.action_queue.clear()
+        self.prev_action = None
 
     def _get_obs_context(self) -> np.ndarray:
         if not self.obs_history:
@@ -1139,6 +1458,95 @@ class DiffusionPolicyWrapper(BasePolicyWrapper):
             pad = [seq[0]] * (self.n_obs_steps - len(seq))
             seq = pad + seq
         return np.stack(seq, axis=0).astype(np.float32)
+
+    def _get_action_bounds(self, env, env_action_dim: int) -> Tuple[np.ndarray, np.ndarray]:
+        low = np.full((env_action_dim,), -1.0, dtype=np.float32)
+        high = np.full((env_action_dim,), 1.0, dtype=np.float32)
+
+        spec = getattr(env, "action_spec", None)
+        if spec is not None:
+            try:
+                spec_low, spec_high = spec
+                low_arr = flatten_value(spec_low)
+                high_arr = flatten_value(spec_high)
+                if low_arr is not None and high_arr is not None:
+                    low = pad_or_trim(low_arr.astype(np.float32, copy=False), env_action_dim)
+                    high = pad_or_trim(high_arr.astype(np.float32, copy=False), env_action_dim)
+                    lo = np.minimum(low, high)
+                    hi = np.maximum(low, high)
+                    low, high = lo, hi
+            except Exception:
+                pass
+
+        return low, high
+
+    def _stabilize_action(
+        self,
+        action: np.ndarray,
+        low: np.ndarray,
+        high: np.ndarray,
+        handle_to_eef: Optional[np.ndarray] = None,
+        door_openness: Optional[float] = None,
+    ) -> np.ndarray:
+        a = np.nan_to_num(action.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Compute distance to handle once so we can use it for both assist and rotation gating.
+        dist: Optional[float] = None
+        if handle_to_eef is not None:
+            h_vec = np.asarray(handle_to_eef, dtype=np.float32).reshape(-1)
+            if h_vec.shape[0] >= 3:
+                dist = float(np.linalg.norm(h_vec[:3]))
+
+        # Blend in a small attractive component toward the current target handle.
+        if (
+            dist is not None
+            and dist > 1e-6
+            and a.shape[0] >= 3
+            and (door_openness is None or door_openness < 0.90)
+        ):
+            h = np.asarray(handle_to_eef, dtype=np.float32).reshape(-1)[:3]
+            assist = np.clip(0.8 * h, -self.handle_assist_max_xyz, self.handle_assist_max_xyz)
+            blend = float(
+                np.clip(dist / self.handle_assist_dist_scale, 0.0, 1.0)
+                * self.handle_assist_strength
+            )
+            a[:3] = (1.0 - blend) * a[:3] + blend * assist
+
+        # In standard 7D robosuite actions, indices [3:6] are orientation deltas.
+        # When the EEF is close to the handle, progressively zero out rotations to
+        # prevent the arm from flipping over while trying to grasp.
+        # At dist >= 0.10 m: use full rotation_scale.
+        # At dist <= 0.03 m: zero out rotations entirely.
+        rot_scale = self.rotation_scale
+        _near_rot_high = 0.10
+        _near_rot_low = 0.03
+        if dist is not None and dist < _near_rot_high:
+            fade = max(0.0, (dist - _near_rot_low) / (_near_rot_high - _near_rot_low))
+            rot_scale = self.rotation_scale * fade
+
+        if a.shape[0] >= 6:
+            a[3:6] *= rot_scale
+
+        if self.prev_action is not None and self.prev_action.shape == a.shape:
+            delta = a - self.prev_action
+            if a.shape[0] >= 3:
+                delta[:3] = np.clip(delta[:3], -self.max_delta_xyz, self.max_delta_xyz)
+            if a.shape[0] >= 6:
+                delta[3:6] = np.clip(delta[3:6], -self.max_delta_rot, self.max_delta_rot)
+            if a.shape[0] >= 7:
+                delta[6:] = np.clip(delta[6:], -self.max_delta_gripper, self.max_delta_gripper)
+            a = self.prev_action + delta
+
+        # When the EEF has reached the handle, force the gripper closed.
+        # Applied after delta smoothing so it is a hard override rather than
+        # being slowed down by the gripper rate limiter.
+        # In robosuite, gripper action -1 = closed for most grippers.
+        if dist is not None and dist < 0.06 and a.shape[0] >= 7:
+            a[6] = -1.0
+
+        a = np.clip(a, low, high)
+        self.prev_action = a.astype(np.float32, copy=True)
+        return self.prev_action
 
     def act(self, obs: Dict[str, np.ndarray], env, env_action_dim: int) -> np.ndarray:
         state = build_state_vector(
@@ -1156,28 +1564,204 @@ class DiffusionPolicyWrapper(BasePolicyWrapper):
             obs_norm = (obs_seq - self.state_mean) / self.state_std
 
             obs_tensor = torch.from_numpy(obs_norm).unsqueeze(0).to(self.device)
+            phase_tensor = None
+            if self.current_phase is not None and self.policy.model.num_phases > 1:
+                phase_tensor = torch.tensor(
+                    [self.current_phase], dtype=torch.long, device=self.device
+                )
             with torch.no_grad():
                 pred_action_norm = self.policy.sample(
                     obs_seq=obs_tensor,
+                    phase=phase_tensor,
                     num_inference_steps=self.num_inference_steps,
                     deterministic=True,
                 )
             pred_action_norm = pred_action_norm.squeeze(0).cpu().numpy()
             pred_action = pred_action_norm * self.action_std + self.action_mean
 
+            handle_feat = self.handle_extractor.extract(env)
+            handle_to_eef = handle_feat.get("handle_to_eef_pos")
+            door_open_arr = handle_feat.get("door_openness")
+            door_openness = (
+                float(np.asarray(door_open_arr, dtype=np.float32).reshape(-1)[0])
+                if door_open_arr is not None and np.asarray(door_open_arr).size > 0
+                else None
+            )
+
+            low, high = self._get_action_bounds(env, env_action_dim)
             chunk = pred_action[: self.n_action_steps]
             for a in chunk:
-                self.action_queue.append(a.astype(np.float32, copy=False))
+                a = pad_or_trim(a.astype(np.float32, copy=False), env_action_dim)
+                a = self._stabilize_action(
+                    a,
+                    low,
+                    high,
+                    handle_to_eef=handle_to_eef,
+                    door_openness=door_openness,
+                )
+                self.action_queue.append(a)
 
         action = self.action_queue.popleft()
         return pad_or_trim(action, env_action_dim)
 
 
+class StagedDiffusionPolicyWrapper(BasePolicyWrapper):
+    """
+    Wraps DiffusionPolicyWrapper with explicit three-phase stage control.
+
+    Phase 0 - Approach: diffusion drives XYZ toward handle; rotations zeroed.
+    Phase 1 - Grasp:    XYZ motion dampened to hold position near handle;
+                        gripper forced closed for grasp_steps to lock grip.
+    Phase 2 - Pull:     diffusion drives the full action (it learned pulling
+                        from demonstrations and runs without override here).
+
+    The phase transitions are purely geometry-driven (handle distance +
+    countdown timer), so no retraining is required.
+    """
+
+    def __init__(
+        self,
+        inner: DiffusionPolicyWrapper,
+        approach_dist_threshold: float = 0.05,
+        reapproach_dist_threshold: float = 0.14,
+        grasp_steps: int = 12,
+        gripper_close_value: float = -1.0,
+        rotation_freeze_dist: float = 0.10,
+    ):
+        super().__init__(
+            inner.state_dim,
+            inner.action_dim,
+            inner.state_keys,
+            inner.state_key_dims,
+        )
+        self.inner = inner
+        self.approach_dist_threshold = float(approach_dist_threshold)
+        self.reapproach_dist_threshold = float(reapproach_dist_threshold)
+        self.grasp_steps = int(max(grasp_steps, 1))
+        self.gripper_close_value = float(gripper_close_value)
+        # Once the arm is within rotation_freeze_dist of the handle, orientation
+        # is locked for the rest of the approach so the arm stops over-rotating.
+        self.rotation_freeze_dist = float(rotation_freeze_dist)
+
+        self.phase = 0
+        self.grasp_countdown = 0
+        self.rotation_frozen = False
+
+    def reset(self):
+        self.inner.reset()
+        self.phase = 0
+        self.grasp_countdown = 0
+        self.rotation_frozen = False
+
+    def _update_phase(self, dist: float):
+        # If EEF drifts too far from handle, reset to approach and unfreeze
+        # rotation so the arm can re-orient on the next approach.
+        if np.isfinite(dist) and dist > self.reapproach_dist_threshold:
+            if self.phase != 0:
+                self.rotation_frozen = False
+            self.phase = 0
+            self.grasp_countdown = 0
+            return
+
+        if self.phase == 0:
+            if np.isfinite(dist) and dist <= self.approach_dist_threshold:
+                self.phase = 1
+                self.grasp_countdown = self.grasp_steps
+            return
+
+        if self.phase == 1:
+            self.grasp_countdown -= 1
+            if self.grasp_countdown <= 0:
+                self.phase = 2
+
+    def act(self, obs: Dict[str, np.ndarray], env, env_action_dim: int) -> np.ndarray:
+        # Measure distance to handle (extractor caches per model/fixture).
+        handle_feat = self.inner.handle_extractor.extract(env)
+        handle_to_eef = handle_feat.get("handle_to_eef_pos")
+
+        dist = float("inf")
+        if handle_to_eef is not None:
+            h = np.asarray(handle_to_eef, dtype=np.float32).reshape(-1)
+            if h.shape[0] >= 3:
+                dist = float(np.linalg.norm(h[:3]))
+
+        prev_phase = self.phase
+        self._update_phase(dist)
+        if self.phase != prev_phase:
+            print(f"[StagedDiffusion] phase {prev_phase} -> {self.phase}  dist={dist:.3f}", flush=True)
+
+        # Tell the inner wrapper which phase we're in so it passes the correct
+        # phase embedding to policy.sample() (only used when model has num_phases > 1).
+        self.inner.current_phase = self.phase
+
+        # Diffusion model generates the base action (with its own stabilisation).
+        action = self.inner.act(obs=obs, env=env, env_action_dim=env_action_dim)
+
+        if self.phase == 0:
+            # Rotation: allow dampened rotation while far so the arm can orient
+            # the gripper correctly.  Once within rotation_freeze_dist, lock
+            # orientation permanently for the rest of the approach — this stops
+            # the arm from over-rotating past the target pose.
+            if np.isfinite(dist) and dist <= self.rotation_freeze_dist and not self.rotation_frozen:
+                self.rotation_frozen = True
+                print(f"[StagedDiffusion] rotation FROZEN at dist={dist:.3f}", flush=True)
+
+            if self.rotation_frozen and action.shape[0] >= 6:
+                action[3:6] = 0.0
+                # Keep inner delta-smoother consistent with what we actually execute.
+                if self.inner.prev_action is not None and self.inner.prev_action.shape == action.shape:
+                    self.inner.prev_action[3:6] = 0.0
+            elif action.shape[0] >= 6:
+                # Not yet frozen: slow rotation down further so the arm orients
+                # gradually without overshooting.  Combined with rotation_scale=0.35
+                # inside _stabilize_action this gives ~0.35*0.25 ≈ 9% of raw rotation.
+                action[3:6] *= 0.25
+
+            # XYZ: proportional geometric controller dominates when far, fades
+            # out near the handle so the learned policy handles fine alignment.
+            if (
+                handle_to_eef is not None
+                and action.shape[0] >= 3
+                and np.isfinite(dist)
+                and dist > 1e-3
+            ):
+                h = np.asarray(handle_to_eef, dtype=np.float32).reshape(-1)[:3]
+                approach = np.clip(0.6 * h, -0.25, 0.25)
+                # geo_weight: 0.80 when far (dist ≥ 0.22 m), fades to 0 at handle
+                geo_weight = float(np.clip((dist - 0.07) / 0.15, 0.0, 0.80))
+                action[:3] = geo_weight * approach + (1.0 - geo_weight) * action[:3]
+
+        elif self.phase == 1:
+            # Grasp: hold position (dampen XYZ), zero rotation, close gripper.
+            # NOTE: we update inner.prev_action to the dampened value so its
+            # delta smoother stays consistent with what we actually executed.
+            if action.shape[0] >= 3:
+                action[:3] *= 0.1
+            if action.shape[0] >= 6:
+                action[3:6] = 0.0
+            if action.shape[0] >= 7:
+                action[6] = self.gripper_close_value
+            # Keep inner wrapper's prev_action in sync with actual executed action.
+            self.inner.prev_action = action.astype(np.float32, copy=True)
+
+        # Phase 2 (pull): diffusion action used as-is — the model learned to
+        # pull the door open from the demonstrations.
+
+        print(f"[StagedDiffusion] phase={self.phase}  dist={dist:.3f}  gripper={action[6] if action.shape[0]>=7 else 'n/a':.2f}", flush=True)
+        return action
+
+
 def load_policy_wrapper(
     checkpoint_path: str,
     device: torch.device,
+    staged_diffusion: bool = True,
 ) -> Tuple[BasePolicyWrapper, PolicyInfo, dict]:
-    """Load either diffusion or legacy MLP checkpoint and return inference wrapper."""
+    """Load either diffusion or legacy MLP checkpoint and return inference wrapper.
+
+    Args:
+        staged_diffusion: When True (default), wraps diffusion checkpoints with
+            StagedDiffusionPolicyWrapper for explicit approach/grasp/pull phases.
+    """
     ckpt = _safe_torch_load(checkpoint_path, device)
 
     state_dim = int(ckpt["state_dim"])
@@ -1190,23 +1774,68 @@ def load_policy_wrapper(
     state_keys = ckpt.get("state_keys")
     state_key_dims = ckpt.get("state_key_dims")
 
+    if checkpoint_type == "staged_bc_handle_pull":
+        model_kwargs = dict(ckpt.get("model_kwargs", {}))
+        phase_cfg = dict(ckpt.get("phase_cfg", {}))
+        model = StageConditionedBCNet(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=int(model_kwargs.get("hidden_dim", 256)),
+            num_phases=int(model_kwargs.get("num_phases", 3)),
+        ).to(device)
+        model.load_state_dict(_unwrap_model_state_dict(ckpt["model_state_dict"]))
+        model.eval()
+
+        norm = ckpt.get("normalization", {})
+        state_mean = np.asarray(norm.get("state_mean"), dtype=np.float32)
+        state_std = np.asarray(norm.get("state_std"), dtype=np.float32)
+        action_mean = np.asarray(norm.get("action_mean"), dtype=np.float32)
+        action_std = np.asarray(norm.get("action_std"), dtype=np.float32)
+
+        wrapper = StagedBCPolicyWrapper(
+            model=model,
+            device=device,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            state_keys=state_keys,
+            state_key_dims=state_key_dims,
+            state_mean=state_mean,
+            state_std=state_std,
+            action_mean=action_mean,
+            action_std=action_std,
+            approach_dist_threshold=float(phase_cfg.get("approach_dist_threshold", 0.08)),
+            reapproach_dist_threshold=float(phase_cfg.get("reapproach_dist_threshold", 0.12)),
+            grasp_steps=int(phase_cfg.get("grasp_steps", 8)),
+            gripper_close_value=float(phase_cfg.get("gripper_close_value", -1.0)),
+        )
+        info = PolicyInfo(
+            model_type="staged_bc_handle_pull",
+            state_dim=state_dim,
+            action_dim=action_dim,
+            epoch=epoch,
+            loss=loss,
+        )
+        return wrapper, info, ckpt
+
     if checkpoint_type == "diffusion_unet_lowdim":
         model_kwargs = dict(ckpt.get("model_kwargs", {}))
         diffusion_kwargs = dict(ckpt.get("diffusion_kwargs", {}))
+        model_state_dict = _unwrap_model_state_dict(ckpt["model_state_dict"])
 
         model = ConditionalUnet1D(
             action_dim=action_dim,
             state_dim=state_dim,
             n_obs_steps=int(model_kwargs["n_obs_steps"]),
             horizon=int(model_kwargs["horizon"]),
-            base_channels=int(model_kwargs.get("base_channels", 128)),
-            channel_mults=tuple(model_kwargs.get("channel_mults", (1, 2, 4))),
-            num_res_blocks=int(model_kwargs.get("num_res_blocks", 2)),
+            base_channels=int(model_kwargs.get("base_channels", 64)),
+            channel_mults=tuple(model_kwargs.get("channel_mults", (1, 2))),
+            num_res_blocks=int(model_kwargs.get("num_res_blocks", 1)),
             time_emb_dim=int(model_kwargs.get("time_emb_dim", 128)),
-            cond_dim=int(model_kwargs.get("cond_dim", 512)),
+            cond_dim=int(model_kwargs.get("cond_dim", 256)),
             dropout=float(model_kwargs.get("dropout", 0.0)),
+            num_phases=int(model_kwargs.get("num_phases", 1)),
         ).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(model_state_dict)
         model.eval()
 
         scheduler = DDPMScheduler(
@@ -1223,7 +1852,7 @@ def load_policy_wrapper(
         action_mean = np.asarray(norm.get("action_mean"), dtype=np.float32)
         action_std = np.asarray(norm.get("action_std"), dtype=np.float32)
 
-        wrapper = DiffusionPolicyWrapper(
+        diffusion_wrapper = DiffusionPolicyWrapper(
             policy=policy,
             device=device,
             state_dim=state_dim,
@@ -1235,9 +1864,15 @@ def load_policy_wrapper(
             action_mean=action_mean,
             action_std=action_std,
             n_obs_steps=int(model_kwargs["n_obs_steps"]),
-            n_action_steps=int(model_kwargs.get("n_action_steps", 8)),
+            n_action_steps=int(model_kwargs.get("n_action_steps", 2)),
             num_inference_steps=int(model_kwargs.get("num_inference_steps", 16)),
         )
+
+        wrapper: BasePolicyWrapper
+        if staged_diffusion:
+            wrapper = StagedDiffusionPolicyWrapper(inner=diffusion_wrapper)
+        else:
+            wrapper = diffusion_wrapper
 
         info = PolicyInfo(
             model_type="diffusion_unet_lowdim",
@@ -1250,7 +1885,7 @@ def load_policy_wrapper(
 
     # Legacy MLP checkpoint support.
     model = SimplePolicyNet(state_dim=state_dim, action_dim=action_dim).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(_unwrap_model_state_dict(ckpt["model_state_dict"]))
     model.eval()
 
     wrapper = SimplePolicyWrapper(

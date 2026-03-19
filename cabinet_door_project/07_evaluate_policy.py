@@ -6,6 +6,7 @@ success rate across multiple episodes and kitchen scenes.
 
 This script supports both:
 - New diffusion U-Net checkpoints from 06_train_policy.py
+- Staged BC checkpoints from 06b_train_staged_bc_policy.py
 - Legacy MLP checkpoints
 
 Success criterion used here: opening any one target cabinet door.

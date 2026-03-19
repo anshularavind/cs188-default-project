@@ -4,7 +4,7 @@
 seed: 42
 
 # Training
-epochs: 100
+epochs: 40
 batch_size: 64
 learning_rate: 1.0e-4
 weight_decay: 1.0e-6
@@ -17,23 +17,24 @@ checkpoint_dir: /tmp/cabinet_policy_checkpoints
 max_episodes: null
 include_augmented: true
 require_augmented: true
-include_all_lowdim: false
+include_all_lowdim: true
+use_observation_state: false
 
 # Diffusion rollout geometry
 horizon: 16
 n_obs_steps: 2
-n_action_steps: 8
-num_diffusion_iters: 100
-num_inference_iters: 16
+n_action_steps: 2
+num_diffusion_iters: 50
+num_inference_iters: 8
 
 # DDPM noise schedule
 beta_start: 1.0e-4
 beta_end: 2.0e-2
 
 # 1D Conv U-Net architecture
-base_channels: 128
-channel_mults: [1, 2, 4]
-num_res_blocks: 2
+base_channels: 64
+channel_mults: [1, 2]
+num_res_blocks: 1
 time_emb_dim: 128
-cond_dim: 512
+cond_dim: 256
 dropout: 0.0

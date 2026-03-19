@@ -1,0 +1,35 @@
+# Staged behavior cloning policy (approach -> grasp -> pull)
+# Used by: python 06b_train_staged_bc_policy.py --config configs/staged_bc_policy.yaml
+
+seed: 42
+
+# Training
+epochs: 40
+batch_size: 256
+learning_rate: 3.0e-4
+weight_decay: 1.0e-6
+num_workers: 0
+grad_clip: 1.0
+log_every: 5
+
+# Data
+checkpoint_dir: /tmp/cabinet_stage_bc_checkpoints
+max_episodes: null
+include_augmented: true
+require_augmented: true
+include_all_lowdim: true
+use_observation_state: false
+
+# Model
+hidden_dim: 256
+
+# Stage labeling and runtime phase switching
+approach_dist_threshold: 0.08
+reapproach_dist_threshold: 0.13
+grasp_steps: 8
+pull_open_threshold: 0.08
+
+# Loss shaping (approach / grasp / pull)
+phase_weights: [1.6, 1.3, 1.0]
+approach_aux_weight: 0.2
+grasp_aux_weight: 0.2

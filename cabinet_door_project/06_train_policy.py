@@ -9,7 +9,7 @@ This script auto-detects and uses 05b augmented parquet files when available.
 Usage:
     python 06_train_policy.py
     python 06_train_policy.py --config configs/diffusion_policy.yaml
-    python 06_train_policy.py --epochs 150 --batch_size 128
+    python 06_train_policy.py --epochs 40 --batch_size 64
 """
 
 import argparse
@@ -81,7 +81,10 @@ def save_checkpoint(
         "checkpoint_type": "diffusion_unet_lowdim",
         "epoch": int(epoch),
         "loss": float(loss),
-        "model_state_dict": model.state_dict(),
+        # Save the bare U-Net weights for straightforward loading.
+        "model_state_dict": (
+            model.model.state_dict() if hasattr(model, "model") else model.state_dict()
+        ),
         "optimizer_state_dict": optimizer.state_dict(),
         "state_dim": int(dataset.state_dim),
         "action_dim": int(dataset.action_dim),
@@ -104,6 +107,11 @@ def save_checkpoint(
             "time_emb_dim": int(config["time_emb_dim"]),
             "cond_dim": int(config["cond_dim"]),
             "dropout": float(config["dropout"]),
+            "num_phases": int(config.get("num_phases", 3)),
+        },
+        "phase_cfg": {
+            "phase_approach_dist": float(config.get("phase_approach_dist", 0.10)),
+            "phase_grasp_openness": float(config.get("phase_grasp_openness", 0.05)),
         },
         "diffusion_kwargs": {
             "num_train_timesteps": int(config["num_diffusion_iters"]),
@@ -140,9 +148,12 @@ def train_diffusion_policy(config):
         n_obs_steps=int(config["n_obs_steps"]),
         include_augmented=bool(config["include_augmented"]),
         include_all_lowdim=bool(config["include_all_lowdim"]),
+        use_observation_state=bool(config.get("use_observation_state", True)),
         max_episodes=(
             None if config.get("max_episodes") in [None, 0] else int(config["max_episodes"])
         ),
+        phase_approach_dist=float(config.get("phase_approach_dist", 0.10)),
+        phase_grasp_openness=float(config.get("phase_grasp_openness", 0.05)),
     )
 
     if bool(config.get("require_augmented", True)) and dataset.source != "augmented":
@@ -160,6 +171,10 @@ def train_diffusion_policy(config):
     print(f"  State dim:          {dataset.state_dim}")
     print(f"  Action dim:         {dataset.action_dim}")
     print(f"  State keys:         {dataset.state_keys}")
+    all_phases = np.concatenate(dataset.episodes_phases)
+    for p, name in [(0, "approach"), (1, "grasp"), (2, "pull")]:
+        pct = 100.0 * np.sum(all_phases == p) / len(all_phases)
+        print(f"  Phase {p} ({name}):    {pct:.1f}% of timesteps")
 
     dataloader = DataLoader(
         dataset,
@@ -184,6 +199,7 @@ def train_diffusion_policy(config):
         time_emb_dim=int(config["time_emb_dim"]),
         cond_dim=int(config["cond_dim"]),
         dropout=float(config["dropout"]),
+        num_phases=int(config.get("num_phases", 3)),
     ).to(device)
 
     scheduler = DDPMScheduler(
@@ -227,9 +243,10 @@ def train_diffusion_policy(config):
         epoch_loss = 0.0
         num_batches = 0
 
-        for obs_seq, action_seq in dataloader:
+        for obs_seq, action_seq, phase in dataloader:
             obs_seq = obs_seq.to(device)
             action_seq = action_seq.to(device)
+            phase = phase.to(device)
 
             obs_norm = (obs_seq - state_mean) / state_std
             action_norm = (action_seq - action_mean) / action_std
@@ -244,7 +261,12 @@ def train_diffusion_policy(config):
             noise = torch.randn_like(action_norm)
             noisy_action = scheduler.add_noise(action_norm, noise, timesteps)
 
-            pred_noise = policy(noisy_action=noisy_action, timesteps=timesteps, obs_seq=obs_norm)
+            pred_noise = policy(
+                noisy_action=noisy_action,
+                timesteps=timesteps,
+                obs_seq=obs_norm,
+                phase=phase,
+            )
             loss = torch.nn.functional.mse_loss(pred_noise, noise)
 
             optimizer.zero_grad(set_to_none=True)
@@ -292,7 +314,7 @@ def train_diffusion_policy(config):
 def default_config():
     return {
         "seed": 42,
-        "epochs": 100,
+        "epochs": 40,
         "batch_size": 64,
         "learning_rate": 1e-4,
         "weight_decay": 1e-6,
@@ -303,19 +325,23 @@ def default_config():
         "max_episodes": None,
         "include_augmented": True,
         "require_augmented": True,
-        "include_all_lowdim": False,
+        "include_all_lowdim": True,
+        "use_observation_state": False,
         "horizon": 16,
         "n_obs_steps": 2,
-        "n_action_steps": 8,
-        "num_diffusion_iters": 100,
-        "num_inference_iters": 16,
+        "n_action_steps": 2,
+        "num_diffusion_iters": 50,
+        "num_inference_iters": 8,
+        "num_phases": 3,
+        "phase_approach_dist": 0.10,
+        "phase_grasp_openness": 0.05,
         "beta_start": 1e-4,
         "beta_end": 2e-2,
-        "base_channels": 128,
-        "channel_mults": [1, 2, 4],
-        "num_res_blocks": 2,
+        "base_channels": 64,
+        "channel_mults": [1, 2],
+        "num_res_blocks": 1,
         "time_emb_dim": 128,
-        "cond_dim": 512,
+        "cond_dim": 256,
         "dropout": 0.0,
     }
 
