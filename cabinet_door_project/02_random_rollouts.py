@@ -15,11 +15,12 @@ import argparse
 import os
 import sys
 
-# Force osmesa (CPU offscreen renderer) on Linux/WSL2 -- EGL requires
-# /dev/dri device access that is unavailable in WSL environments.
-if sys.platform == "linux":
-    os.environ.setdefault("MUJOCO_GL", "osmesa")
-    os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+from runtime_setup import configure_offscreen_gl
+
+# Linux backend policy:
+# - Colab / non-WSL Linux: egl
+# - WSL: osmesa
+configure_offscreen_gl()
 
 import numpy as np
 

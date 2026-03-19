@@ -1,29 +1,33 @@
 """
-Step 6: Train a Diffusion Policy
-==================================
-This script provides a self-contained training loop for a simple
-behavior-cloning policy on the OpenCabinet task, suitable for
-understanding the training pipeline.
+Step 6: Train a Low-Dim Diffusion Policy (1D Conv U-Net)
+===========================================================
+Trains a state-based diffusion policy for OpenCabinet using a 1D Conv U-Net
+backbone, following the instructor recommendation.
 
-For production-quality training, use the official Diffusion Policy repo:
-    git clone https://github.com/robocasa-benchmark/diffusion_policy
-    cd diffusion_policy && pip install -e .
-    python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
-
-This simplified version trains a small CNN+MLP policy to demonstrate
-the data loading -> training -> checkpoint pipeline.
+This script auto-detects and uses 05b augmented parquet files when available.
 
 Usage:
-    python 06_train_policy.py [--epochs 50] [--batch_size 32] [--lr 1e-4]
-    python 06_train_policy.py --use_diffusion_policy   # Use official repo
+    python 06_train_policy.py
+    python 06_train_policy.py --config configs/diffusion_policy.yaml
+    python 06_train_policy.py --epochs 150 --batch_size 128
 """
 
 import argparse
 import os
+import random
 import sys
-import yaml
+from pathlib import Path
 
 import numpy as np
+import yaml
+
+from policy_common import (
+    CabinetSequenceDataset,
+    ConditionalUnet1D,
+    DDPMScheduler,
+    DiffusionPolicyCore,
+)
+from runtime_setup import select_torch_device
 
 
 def print_section(title):
@@ -33,7 +37,6 @@ def print_section(title):
 
 
 def load_config(config_path):
-    """Load training configuration from YAML file."""
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
@@ -50,359 +53,326 @@ def get_dataset_path():
     return path
 
 
-def train_simple_policy(config):
-    """
-    Train a simple behavior-cloning policy.
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
 
-    This is a simplified training loop to illustrate the pipeline.
-    For real results, use the official Diffusion Policy codebase.
-    """
+    import torch
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def save_checkpoint(
+    path,
+    epoch,
+    loss,
+    model,
+    optimizer,
+    dataset,
+    config,
+):
+    ckpt = {
+        "checkpoint_type": "diffusion_unet_lowdim",
+        "epoch": int(epoch),
+        "loss": float(loss),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "state_dim": int(dataset.state_dim),
+        "action_dim": int(dataset.action_dim),
+        "state_keys": list(dataset.state_keys),
+        "state_key_dims": dict(dataset.state_key_dims),
+        "normalization": {
+            "state_mean": dataset.state_mean,
+            "state_std": dataset.state_std,
+            "action_mean": dataset.action_mean,
+            "action_std": dataset.action_std,
+        },
+        "model_kwargs": {
+            "horizon": int(config["horizon"]),
+            "n_obs_steps": int(config["n_obs_steps"]),
+            "n_action_steps": int(config["n_action_steps"]),
+            "num_inference_steps": int(config["num_inference_iters"]),
+            "base_channels": int(config["base_channels"]),
+            "channel_mults": list(config["channel_mults"]),
+            "num_res_blocks": int(config["num_res_blocks"]),
+            "time_emb_dim": int(config["time_emb_dim"]),
+            "cond_dim": int(config["cond_dim"]),
+            "dropout": float(config["dropout"]),
+        },
+        "diffusion_kwargs": {
+            "num_train_timesteps": int(config["num_diffusion_iters"]),
+            "beta_start": float(config["beta_start"]),
+            "beta_end": float(config["beta_end"]),
+        },
+        "config": dict(config),
+    }
+    import torch
+
+    torch.save(ckpt, path)
+
+
+def train_diffusion_policy(config):
     try:
         import torch
-        import torch.nn as nn
-        from torch.utils.data import DataLoader, Dataset
+        from torch.utils.data import DataLoader
     except ImportError:
         print("ERROR: PyTorch is required for training.")
         print("Install with: pip install torch torchvision")
         sys.exit(1)
 
-    print_section("Simple Behavior Cloning Policy")
+    set_seed(int(config["seed"]))
+
+    print_section("Low-Dim Diffusion Policy (1D Conv U-Net)")
 
     dataset_path = get_dataset_path()
     print(f"Dataset: {dataset_path}")
 
-    # ----------------------------------------------------------------
-    # 1. Build a simple dataset from the LeRobot format
-    # ----------------------------------------------------------------
-    print("\nLoading dataset...")
-
-    class CabinetDemoDataset(Dataset):
-        """
-        Loads state-action pairs from the LeRobot-format dataset.
-
-        For simplicity, this uses only the low-dimensional state observations
-        (gripper qpos, base pose, eef pose) rather than images.
-        Full visuomotor training with images requires the Diffusion Policy repo.
-        """
-
-        def __init__(self, dataset_path, max_episodes=None):
-            import pyarrow.parquet as pq
-
-            self.states = []
-            self.actions = []
-
-            # The dataset path from get_ds_path may point to the lerobot dir directly
-            # or to the parent. Try both layouts.
-            data_dir = os.path.join(dataset_path, "data")
-            if not os.path.exists(data_dir):
-                data_dir = os.path.join(dataset_path, "lerobot", "data")
-            if not os.path.exists(data_dir):
-                raise FileNotFoundError(
-                    f"Data directory not found under: {dataset_path}\n"
-                    "Make sure you downloaded the dataset with 04_download_dataset.py"
-                )
-
-            # Load parquet files
-            chunk_dir = os.path.join(data_dir, "chunk-000")
-            if not os.path.exists(chunk_dir):
-                raise FileNotFoundError(f"Chunk directory not found: {chunk_dir}")
-
-            parquet_files = sorted(
-                f for f in os.listdir(chunk_dir) if f.endswith(".parquet")
-            )
-            if not parquet_files:
-                raise FileNotFoundError(f"No parquet files found in {chunk_dir}")
-
-            episodes_loaded = 0
-            for pf in parquet_files:
-                table = pq.read_table(os.path.join(chunk_dir, pf))
-                df = table.to_pandas()
-
-                # Extract state and action columns
-                state_cols = [
-                    c for c in df.columns if c.startswith("observation.state")
-                ]
-                action_cols = [
-                    c for c in df.columns
-                    if c == "action" or c.startswith("action.")
-                ]
-
-                if not state_cols or not action_cols:
-                    # Try alternative column naming
-                    state_cols = [
-                        c
-                        for c in df.columns
-                        if "gripper" in c or "base" in c or "eef" in c
-                    ]
-                    action_cols = [c for c in df.columns if "action" in c]
-
-                if state_cols and action_cols:
-                    for _, row in df.iterrows():
-                        # Values may be numpy arrays (object columns) or scalars
-                        state_parts = []
-                        for c in state_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                state_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                state_parts.append(float(val))
-                        action_parts = []
-                        for c in action_cols:
-                            val = row[c]
-                            if isinstance(val, np.ndarray):
-                                action_parts.extend(val.flatten().tolist())
-                            elif isinstance(val, (int, float, np.floating)):
-                                action_parts.append(float(val))
-
-                        if state_parts and action_parts:
-                            self.states.append(np.array(state_parts, dtype=np.float32))
-                            self.actions.append(np.array(action_parts, dtype=np.float32))
-
-                episodes_loaded += 1
-                if max_episodes and episodes_loaded >= max_episodes:
-                    break
-
-            if len(self.states) == 0:
-                print("WARNING: Could not extract state-action pairs from parquet files.")
-                print("The dataset may use a different format.")
-                print("Generating synthetic demo data for illustration...")
-                self._generate_synthetic_data()
-
-            self.states = np.array(self.states, dtype=np.float32)
-            self.actions = np.array(self.actions, dtype=np.float32)
-
-            print(f"Loaded {len(self.states)} state-action pairs")
-            print(f"State dim:  {self.states.shape[-1]}")
-            print(f"Action dim: {self.actions.shape[-1]}")
-
-        def _generate_synthetic_data(self):
-            """Generate synthetic data for demonstration purposes."""
-            rng = np.random.default_rng(42)
-            for _ in range(1000):
-                state = rng.standard_normal(16).astype(np.float32)
-                action = rng.standard_normal(12).astype(np.float32) * 0.1
-                self.states.append(state)
-                self.actions.append(action)
-
-        def __len__(self):
-            return len(self.states)
-
-        def __getitem__(self, idx):
-            return (
-                torch.from_numpy(self.states[idx]),
-                torch.from_numpy(self.actions[idx]),
-            )
-
-    dataset = CabinetDemoDataset(dataset_path, max_episodes=50)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        drop_last=True,
+    print("\nLoading sequence dataset...")
+    dataset = CabinetSequenceDataset(
+        dataset_path=dataset_path,
+        horizon=int(config["horizon"]),
+        n_obs_steps=int(config["n_obs_steps"]),
+        include_augmented=bool(config["include_augmented"]),
+        include_all_lowdim=bool(config["include_all_lowdim"]),
+        max_episodes=(
+            None if config.get("max_episodes") in [None, 0] else int(config["max_episodes"])
+        ),
     )
 
-    # ----------------------------------------------------------------
-    # 2. Define a simple MLP policy
-    # ----------------------------------------------------------------
-    state_dim = dataset.states.shape[-1]
-    action_dim = dataset.actions.shape[-1]
+    if bool(config.get("require_augmented", True)) and dataset.source != "augmented":
+        raise RuntimeError(
+            "Augmented data was required, but trainer loaded raw parquet files.\\n"
+            "Run: python 05b_augment_handle_data.py\\n"
+            "If you intentionally want raw data, use --allow_raw."
+        )
 
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
-                nn.Tanh(),
-            )
+    print(f"  Data source:        {dataset.source}")
+    if dataset.source == "augmented":
+        print("  Augmented features: enabled (verified)")
+    print(f"  Episodes loaded:    {len(dataset.episodes_states)}")
+    print(f"  Training windows:   {len(dataset)}")
+    print(f"  State dim:          {dataset.state_dim}")
+    print(f"  Action dim:         {dataset.action_dim}")
+    print(f"  State keys:         {dataset.state_keys}")
 
-        def forward(self, state):
-            return self.net(state)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=int(config["batch_size"]),
+        shuffle=True,
+        drop_last=True,
+        num_workers=int(config["num_workers"]),
+        pin_memory=torch.cuda.is_available(),
+    )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_torch_device()
     print(f"\nDevice: {device}")
 
-    model = SimplePolicy(state_dim, action_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
+    unet = ConditionalUnet1D(
+        action_dim=dataset.action_dim,
+        state_dim=dataset.state_dim,
+        n_obs_steps=int(config["n_obs_steps"]),
+        horizon=int(config["horizon"]),
+        base_channels=int(config["base_channels"]),
+        channel_mults=tuple(config["channel_mults"]),
+        num_res_blocks=int(config["num_res_blocks"]),
+        time_emb_dim=int(config["time_emb_dim"]),
+        cond_dim=int(config["cond_dim"]),
+        dropout=float(config["dropout"]),
+    ).to(device)
 
-    # ----------------------------------------------------------------
-    # 3. Training loop
-    # ----------------------------------------------------------------
+    scheduler = DDPMScheduler(
+        num_train_timesteps=int(config["num_diffusion_iters"]),
+        beta_start=float(config["beta_start"]),
+        beta_end=float(config["beta_end"]),
+    )
+
+    policy = DiffusionPolicyCore(model=unet, scheduler=scheduler).to(device)
+
+    optimizer = torch.optim.AdamW(
+        policy.parameters(),
+        lr=float(config["learning_rate"]),
+        weight_decay=float(config["weight_decay"]),
+    )
+
+    # Normalization tensors for fast broadcasting in training loop.
+    state_mean = torch.from_numpy(dataset.state_mean).to(device).view(1, 1, -1)
+    state_std = torch.from_numpy(dataset.state_std).to(device).view(1, 1, -1)
+    action_mean = torch.from_numpy(dataset.action_mean).to(device).view(1, 1, -1)
+    action_std = torch.from_numpy(dataset.action_std).to(device).view(1, 1, -1)
+
+    print(f"Model params: {count_parameters(policy):,}")
+
     print_section("Training")
-    print(f"Epochs:     {config['epochs']}")
-    print(f"Batch size: {config['batch_size']}")
-    print(f"LR:         {config['learning_rate']}")
+    print(f"Epochs:            {config['epochs']}")
+    print(f"Batch size:        {config['batch_size']}")
+    print(f"LR:                {config['learning_rate']}")
+    print(f"Diffusion steps:   {config['num_diffusion_iters']}")
+    print(f"Action horizon:    {config['horizon']}")
+    print(f"Obs steps:         {config['n_obs_steps']}")
 
-    checkpoint_dir = config.get("checkpoint_dir", "/tmp/cabinet_policy_checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_dir = Path(config["checkpoint_dir"])
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     best_loss = float("inf")
     avg_loss = float("inf")
-    ckpt_path = os.path.join(checkpoint_dir, "best_policy.pt")
-    for epoch in range(config["epochs"]):
+
+    for epoch in range(int(config["epochs"])):
+        policy.train()
         epoch_loss = 0.0
         num_batches = 0
 
-        model.train()
-        for states_batch, actions_batch in dataloader:
-            states_batch = states_batch.to(device)
-            actions_batch = actions_batch.to(device)
+        for obs_seq, action_seq in dataloader:
+            obs_seq = obs_seq.to(device)
+            action_seq = action_seq.to(device)
 
-            pred_actions = model(states_batch)
-            loss = nn.functional.mse_loss(pred_actions, actions_batch)
+            obs_norm = (obs_seq - state_mean) / state_std
+            action_norm = (action_seq - action_mean) / action_std
 
-            optimizer.zero_grad()
+            timesteps = torch.randint(
+                low=0,
+                high=int(config["num_diffusion_iters"]),
+                size=(action_norm.shape[0],),
+                device=device,
+            )
+
+            noise = torch.randn_like(action_norm)
+            noisy_action = scheduler.add_noise(action_norm, noise, timesteps)
+
+            pred_noise = policy(noisy_action=noisy_action, timesteps=timesteps, obs_seq=obs_norm)
+            loss = torch.nn.functional.mse_loss(pred_noise, noise)
+
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if float(config["grad_clip"]) > 0:
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), float(config["grad_clip"]))
             optimizer.step()
 
-            epoch_loss += loss.item()
+            epoch_loss += float(loss.item())
             num_batches += 1
 
         avg_loss = epoch_loss / max(num_batches, 1)
 
-        if (epoch + 1) % 10 == 0 or epoch == 0:
+        if (epoch + 1) % int(config["log_every"]) == 0 or epoch == 0:
             print(f"  Epoch {epoch + 1:4d}/{config['epochs']}  Loss: {avg_loss:.6f}")
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            ckpt_path = os.path.join(checkpoint_dir, "best_policy.pt")
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": best_loss,
-                    "state_dim": state_dim,
-                    "action_dim": action_dim,
-                },
-                ckpt_path,
+            save_checkpoint(
+                path=str(checkpoint_dir / "best_policy.pt"),
+                epoch=epoch + 1,
+                loss=best_loss,
+                model=policy,
+                optimizer=optimizer,
+                dataset=dataset,
+                config=config,
             )
 
-    # Save final checkpoint
-    final_path = os.path.join(checkpoint_dir, "final_policy.pt")
-    torch.save(
-        {
-            "epoch": config["epochs"],
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "loss": avg_loss,
-            "state_dim": state_dim,
-            "action_dim": action_dim,
-        },
-        final_path,
+    save_checkpoint(
+        path=str(checkpoint_dir / "final_policy.pt"),
+        epoch=int(config["epochs"]),
+        loss=avg_loss,
+        model=policy,
+        optimizer=optimizer,
+        dataset=dataset,
+        config=config,
     )
 
-    print(f"\nTraining complete!")
+    print("\nTraining complete!")
     print(f"Best loss:        {best_loss:.6f}")
-    print(f"Best checkpoint:  {ckpt_path}")
-    print(f"Final checkpoint: {final_path}")
-
-    print_section("Next Steps")
-    print(
-        "This simple MLP policy is for educational purposes only.\n"
-        "For a policy that can actually solve the task, use the\n"
-        "official Diffusion Policy codebase:\n"
-        "\n"
-        "  git clone https://github.com/robocasa-benchmark/diffusion_policy\n"
-        "  cd diffusion_policy && pip install -e .\n"
-        "  python train.py \\\n"
-        "    --config-name=train_diffusion_transformer_bs192 \\\n"
-        "    task=robocasa/OpenCabinet\n"
-        "\n"
-        "Alternatively, try pi-0 or GR00T N1.5:\n"
-        "  https://github.com/robocasa-benchmark/openpi\n"
-        "  https://github.com/robocasa-benchmark/Isaac-GR00T"
-    )
+    print(f"Best checkpoint:  {checkpoint_dir / 'best_policy.pt'}")
+    print(f"Final checkpoint: {checkpoint_dir / 'final_policy.pt'}")
 
 
-def print_diffusion_policy_instructions():
-    """Print instructions for using the official Diffusion Policy repo."""
-    print_section("Official Diffusion Policy Training")
-    print(
-        "For production-quality policy training, use the official repos:\n"
-        "\n"
-        "Option A: Diffusion Policy (recommended for single-task)\n"
-        "  git clone https://github.com/robocasa-benchmark/diffusion_policy\n"
-        "  cd diffusion_policy && pip install -e .\n"
-        "\n"
-        "  # Train\n"
-        "  python train.py \\\n"
-        "    --config-name=train_diffusion_transformer_bs192 \\\n"
-        "    task=robocasa/OpenCabinet\n"
-        "\n"
-        "  # Evaluate\n"
-        "  python eval_robocasa.py \\\n"
-        "    --checkpoint <path-to-checkpoint> \\\n"
-        "    --task_set atomic \\\n"
-        "    --split target\n"
-        "\n"
-        "Option B: pi-0 via OpenPi (for foundation model fine-tuning)\n"
-        "  git clone https://github.com/robocasa-benchmark/openpi\n"
-        "  cd openpi && pip install -e . && pip install -e packages/openpi-client/\n"
-        "\n"
-        "  XLA_PYTHON_CLIENT_MEM_FRACTION=1.0 python scripts/train.py \\\n"
-        "    robocasa_OpenCabinet --exp-name=cabinet_door\n"
-        "\n"
-        "Option C: GR00T N1.5 (NVIDIA foundation model)\n"
-        "  git clone https://github.com/robocasa-benchmark/Isaac-GR00T\n"
-        "  cd groot && pip install -e .\n"
-        "\n"
-        "  python scripts/gr00t_finetune.py \\\n"
-        "    --output-dir experiments/cabinet_door \\\n"
-        "    --dataset_soup robocasa_OpenCabinet \\\n"
-        "    --max_steps 50000\n"
-    )
+def default_config():
+    return {
+        "seed": 42,
+        "epochs": 100,
+        "batch_size": 64,
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-6,
+        "num_workers": 0,
+        "grad_clip": 1.0,
+        "log_every": 5,
+        "checkpoint_dir": "/tmp/cabinet_policy_checkpoints",
+        "max_episodes": None,
+        "include_augmented": True,
+        "require_augmented": True,
+        "include_all_lowdim": False,
+        "horizon": 16,
+        "n_obs_steps": 2,
+        "n_action_steps": 8,
+        "num_diffusion_iters": 100,
+        "num_inference_iters": 16,
+        "beta_start": 1e-4,
+        "beta_end": 2e-2,
+        "base_channels": 128,
+        "channel_mults": [1, 2, 4],
+        "num_res_blocks": 2,
+        "time_emb_dim": 128,
+        "cond_dim": 512,
+        "dropout": 0.0,
+    }
+
+
+def merge_config(base, override):
+    merged = dict(base)
+    for k, v in override.items():
+        if v is not None:
+            merged[k] = v
+    return merged
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a policy for OpenCabinet")
-    parser.add_argument("--epochs", type=int, default=50, help="Training epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=str,
-        default="/tmp/cabinet_policy_checkpoints",
-        help="Directory to save checkpoints",
-    )
+    parser = argparse.ArgumentParser(description="Train a diffusion policy for OpenCabinet")
     parser.add_argument(
         "--config",
         type=str,
         default=None,
-        help="Path to YAML config file (overrides other args)",
+        help="Path to YAML config file",
     )
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
+    parser.add_argument("--max_episodes", type=int, default=None)
     parser.add_argument(
-        "--use_diffusion_policy",
+        "--allow_raw",
         action="store_true",
-        help="Print instructions for using the official Diffusion Policy repo",
+        help="Allow training on raw parquet data (disables augmented-data requirement)",
     )
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  OpenCabinet - Policy Training")
+    print("  OpenCabinet - Diffusion Policy Training")
     print("=" * 60)
 
-    if args.use_diffusion_policy:
-        print_diffusion_policy_instructions()
-        return
+    cfg = default_config()
 
-    # Build config from args or YAML file
     if args.config:
-        config = load_config(args.config)
-    else:
-        config = {
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "learning_rate": args.lr,
-            "checkpoint_dir": args.checkpoint_dir,
-        }
+        cfg_path = Path(args.config)
+        if not cfg_path.exists():
+            print(f"ERROR: Config file not found: {cfg_path}")
+            sys.exit(1)
+        cfg = merge_config(cfg, load_config(str(cfg_path)))
 
-    train_simple_policy(config)
+    cli_overrides = {
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "checkpoint_dir": args.checkpoint_dir,
+        "max_episodes": args.max_episodes,
+    }
+    cfg = merge_config(cfg, cli_overrides)
+    if args.allow_raw:
+        cfg["require_augmented"] = False
+
+    train_diffusion_policy(cfg)
 
 
 if __name__ == "__main__":

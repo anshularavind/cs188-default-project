@@ -1,49 +1,39 @@
-# Training configuration for the simple behavior cloning policy
-# For the full Diffusion Policy, use the official repo config instead.
+# Low-dimensional diffusion policy config (1D Conv U-Net)
+# Used by: python 06_train_policy.py --config configs/diffusion_policy.yaml
 
-# Training parameters
+seed: 42
+
+# Training
 epochs: 100
 batch_size: 64
-learning_rate: 0.0001
+learning_rate: 1.0e-4
+weight_decay: 1.0e-6
+num_workers: 0
+grad_clip: 1.0
+log_every: 5
 
-# Checkpoint saving
+# Data
 checkpoint_dir: /tmp/cabinet_policy_checkpoints
+max_episodes: null
+include_augmented: true
+require_augmented: true
+include_all_lowdim: false
 
-# ---------------------------------------------------------------
-# Reference: Official Diffusion Policy config keys
-# (used when training with the robocasa-benchmark/diffusion_policy repo)
-#
-# task: robocasa/OpenCabinet
-# horizon: 16             # prediction horizon (number of future actions)
-# n_obs_steps: 2          # number of observation steps as context
-# n_action_steps: 8       # number of actions to execute per step
-#
-# policy:
-#   type: diffusion_transformer
-#   n_layers: 8
-#   n_heads: 4
-#   d_model: 256
-#   noise_scheduler: ddpm
-#   num_diffusion_iters: 100
-#   num_inference_iters: 16
-#
-# training:
-#   batch_size: 192
-#   lr: 1.0e-4
-#   weight_decay: 1.0e-6
-#   num_epochs: 3000
-#   lr_scheduler: cosine
-#   lr_warmup_steps: 500
-#
-# observation:
-#   image_keys:
-#     - robot0_agentview_left_image
-#     - robot0_agentview_right_image
-#     - robot0_eye_in_hand_image
-#   low_dim_keys:
-#     - robot0_gripper_qpos
-#     - robot0_base_pos
-#     - robot0_base_quat
-#     - robot0_base_to_eef_pos
-#     - robot0_base_to_eef_quat
-# ---------------------------------------------------------------
+# Diffusion rollout geometry
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+num_diffusion_iters: 100
+num_inference_iters: 16
+
+# DDPM noise schedule
+beta_start: 1.0e-4
+beta_end: 2.0e-2
+
+# 1D Conv U-Net architecture
+base_channels: 128
+channel_mults: [1, 2, 4]
+num_res_blocks: 2
+time_emb_dim: 128
+cond_dim: 512
+dropout: 0.0

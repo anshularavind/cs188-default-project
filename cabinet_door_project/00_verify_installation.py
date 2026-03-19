@@ -8,12 +8,12 @@ environment can be created successfully.
 import os
 import sys
 
-# On Linux/WSL2, EGL offscreen rendering requires /dev/dri device access which
-# is unavailable in most WSL environments.  Force osmesa (CPU-based offscreen
-# renderer) so the environment-creation check doesn't require a GPU.
-if sys.platform == "linux":
-    os.environ.setdefault("MUJOCO_GL", "osmesa")
-    os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+from runtime_setup import configure_offscreen_gl
+
+# Linux backend policy:
+# - Colab / non-WSL Linux: egl
+# - WSL: osmesa
+configure_offscreen_gl()
 
 
 def check_package(name, min_version=None):

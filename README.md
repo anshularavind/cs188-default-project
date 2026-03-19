@@ -58,6 +58,54 @@ python 00_verify_installation.py
 > **macOS note:** Scripts that open a rendering window (03, 05) require
 > `mjpython` instead of `python`. The install script will remind you of this.
 
+### Colab Setup
+
+You can run this project on Google Colab (GPU runtime recommended) without
+creating a local `.venv`.
+
+```bash
+# In a Colab cell
+REPO_URL="<your-repo-url>"
+REPO_DIR="/content/cs188-default-project"
+!git clone "$REPO_URL" "$REPO_DIR"
+%cd $REPO_DIR
+!python cabinet_door_project/99_colab_setup.py --verify
+```
+
+Then run the project scripts from `cabinet_door_project/` as usual:
+
+```bash
+%cd cabinet_door_project
+!python 04_download_dataset.py
+!python 05b_augment_handle_data.py
+!python 06_train_policy.py --config configs/diffusion_policy.yaml
+```
+
+One-cell quickstart (copy/paste into a single Colab cell):
+
+```python
+# ==== Edit this first ====
+REPO_URL = "<your-repo-url>"
+REPO_DIR = "/content/cs188-default-project"
+
+# ==== Bootstrap ====
+!git clone {REPO_URL} {REPO_DIR}
+%cd $REPO_DIR
+!python cabinet_door_project/99_colab_setup.py --verify
+%cd cabinet_door_project
+
+# ==== Data + augmentation ====
+!python 04_download_dataset.py
+!python 05b_augment_handle_data.py
+
+# ==== Quick sanity train (faster) ====
+!python 06_train_policy.py --config configs/diffusion_policy.yaml --epochs 5 --max_episodes 40 --batch_size 32
+
+# ==== Evaluate + rollout video ====
+!python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt --num_rollouts 10
+!python 08_visualize_policy_rollout.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt --offscreen --video_path /tmp/policy_rollout.mp4
+```
+
 ---
 
 ## Project Structure
@@ -70,9 +118,11 @@ cabinet_door_project/
   03_teleop_collect_demos.py     # Teleoperate the robot to collect your own demonstrations
   04_download_dataset.py         # Download the pre-collected OpenCabinet dataset
   05_playback_demonstrations.py  # Play back demonstrations to see expert behavior
-  06_train_policy.py             # Train a simple MLP behavior-cloning policy
+  06_train_policy.py             # Train a low-dim diffusion policy (1D Conv U-Net)
   07_evaluate_policy.py          # Evaluate your trained policy in simulation
   08_visualize_policy_rollout.py # Visualize a rollout of your policy in RoboCasa
+  99_colab_setup.py              # Install deps / bootstrap in Google Colab
+  runtime_setup.py               # Runtime backend + device selection helpers
   configs/
     diffusion_policy.yaml        # Training hyperparameters
   notebook.ipynb                 # Interactive Jupyter notebook companion
@@ -167,12 +217,12 @@ doors. This is the data your policy will learn from.
 python 06_train_policy.py
 ```
 
-Trains a simple MLP behavior-cloning policy on low-dimensional state-action
-pairs from the demonstration data. This is meant to illustrate the
-data-loading → training → checkpoint pipeline, not to produce a policy that
-can reliably solve the task.
+Trains a low-dimensional diffusion policy (1D Conv U-Net) on state-action
+pairs from the demonstration data.
+If you ran `05b_augment_handle_data.py`, the trainer auto-detects those
+augmented parquet files and includes the extra handle/door features.
 
-For a policy that actually works, use one of the official training repos:
+For larger-scale / production training, you can also use the official repos:
 
 ```bash
 # Diffusion Policy (recommended for single-task)
@@ -181,12 +231,7 @@ cd diffusion_policy && pip install -e .
 python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
 ```
 
-You can also print setup instructions for Diffusion Policy, pi-0, and GR00T
-directly from the script:
-
-```bash
-python 06_train_policy.py --use_diffusion_policy
-```
+Configuration is in `cabinet_door_project/configs/diffusion_policy.yaml`.
 
 ### Step 7: Evaluate Your Policy
 
@@ -206,7 +251,7 @@ rate across multiple episodes and kitchen scenes.
 - **Goal**: Open a kitchen cabinet door
 - **Fixture**: `HingeCabinet` (a cabinet with hinged doors)
 - **Initial state**: Cabinet door is closed; robot is positioned nearby
-- **Success**: `fixture.is_open(env)` returns `True`
+- **Success (evaluation script)**: any one target door reaches open threshold
 - **Horizon**: 500 timesteps at 20 Hz control frequency (25 seconds)
 - **Scene variety**: 2,500+ kitchen layouts/styles for generalization
 
@@ -284,21 +329,20 @@ dataset/
 
 ## Research Directions
 
-The MLP baseline in `06_train_policy.py` is intentionally simple — it
-demonstrates the pipeline but will basically always fail. Here are three
-fun directions to improve the model:
+The low-dim diffusion baseline in `06_train_policy.py` is intentionally
+compact and CPU/GPU-friendly. Here are three fun directions to improve it:
 
-### Minimal Diffusion Policy
+### Stronger Diffusion Policy
 
-Replace the direct-regression MLP with a diffusion-based action generator.
+Scale the current diffusion setup (larger U-Net, more diffusion steps, and
+better normalization / schedulers) for higher success rates.
 The core loop is to corrupt ground-truth actions with Gaussian noise,
 train the network to predict that noise conditioned on the current state, and
 at inference iteratively denoise from pure noise to produce an action. This
 properly handles multi-modal demonstrations (e.g., approaching the handle from
 the left vs. right) that MSE loss averages into useless mean actions.
 See [Chi et al., 2023](https://diffusion-policy.cs.columbia.edu/) for the
-full approach — a minimal version can be built in ~100 lines on top of the
-existing MLP backbone.
+full approach.
 
 ### DAgger (Online Correction)
 
