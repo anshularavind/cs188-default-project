@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CS 188 Final Project | Team 23</title>
+  <meta name="description" content="CS 188 Final Project website for OpenCabinet imitation learning using Temporal Behavior Cloning with a 1D Conditional U-Net backbone.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="container nav-wrap">
+      <a class="brand" href="#hero">CS 188 Team 23</a>
+      <nav class="site-nav" aria-label="Main navigation">
+        <a href="#problem">Problem</a>
+        <a href="#method">Method</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#training">Training</a>
+        <a href="#evaluation">Evaluation</a>
+        <a href="#lessons">Lessons</a>
+        <a href="#demo">Demo</a>
+        <a href="#repro">Reproducibility</a>
+        <a href="#team">Team</a>
+        <a href="#credits">Credits</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section id="hero" class="hero">
+      <div class="container">
+        <p class="eyebrow">COM SCI 188 (Winter 2026) · Final Project</p>
+        <h1>OpenCabinet Imitation Learning</h1>
+        <p class="subtitle">
+          Default Project (COM SCI 188): Temporal Behavior Cloning with a 1D Conditional U-Net backbone (06c),
+          focused on action chunking, overfitting, checkpoint selection, and reproducibility under limited demonstrations.
+        </p>
+        <p class="team-line"><strong>Team 23:</strong> Anshul Aravind · Jeffrey Liu</p>
+      </div>
+    </section>
+
+    <section id="problem" class="section">
+      <div class="container card">
+        <h2>Problem Statement</h2>
+        <p>
+          We selected the CS 188 default project: learning an imitation policy for the RoboCasa OpenCabinet task,
+          where a robot opens cabinet doors across varied kitchen layouts, handle types, and start poses.
+          From 107 demonstrations, we converted trajectories into state-action pairs and trained a policy to
+          reproduce robust cabinet-opening behavior in rollout.
+        </p>
+        <figure class="media-figure">
+          <img
+            src="Screenshot 2026-03-20 at 8.58.04 PM.png"
+            alt="OpenCabinet environment scene with robot arm approaching cabinet doors">
+          <figcaption>OpenCabinet task scene used for imitation learning experiments.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="method" class="section">
+      <div class="container card">
+        <h2>Method Overview</h2>
+        <p>
+          Our final policy is a multi-step behavior cloning model with a 1D Conditional U-Net sequence backbone.
+          At each decision point, the model conditions on recent state history and predicts a chunk of future actions
+          in one forward pass, which improves smoothness relative to single-step action prediction.
+        </p>
+        <p>
+          We optimize a combined objective: (1) MSE action loss, (2) L1 reconstruction loss, and (3) velocity
+          consistency on temporal differences. During execution, predicted action chunks are denormalized and only
+          the next few actions are executed before replanning in a feedback loop.
+        </p>
+        <p>
+          We first attempted diffusion policy, but iteration was too slow and unstable for our compute/runtime
+          constraints and dataset size, so we moved to Temporal BC for faster and more reproducible progress.
+        </p>
+      </div>
+    </section>
+
+    <section id="architecture" class="section">
+      <div class="container card">
+        <h2>Architecture</h2>
+        <p>
+          Fig 2a shows the behavior cloning pipeline from observation conditioning to chunked action prediction.
+          Fig 2b shows the 1D U-Net backbone with down/mid/up paths and conditional residual blocks used for
+          temporal sequence regression.
+        </p>
+        <figure class="media-figure">
+          <img
+            src="Screenshot 2026-03-20 at 8.58.47 PM.png"
+            alt="Behavior cloning pipeline and 1D U-Net backbone architecture diagrams">
+          <figcaption>Fig 2a and Fig 2b: behavior cloning pipeline and 1D U-Net backbone.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="training" class="section">
+      <div class="container card">
+        <h2>Training Setup / Hyperparameters</h2>
+        <p>
+          Training used 107 demonstrations with provided RoboCasa metadata augmentation (e.g., handle position,
+          end-effector distance, and hinge angle features). We trained for 400 epochs and selected checkpoints by
+          rollout quality rather than train loss alone.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Value</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Backbone</td>
+                <td>1D Conditional U-Net (06c)</td>
+                <td>Temporal BC setting</td>
+              </tr>
+              <tr>
+                <td>Training Epochs</td>
+                <td>400</td>
+                <td>Best checkpoint selected from periodic eval</td>
+              </tr>
+              <tr>
+                <td>Chunk Length</td>
+                <td>16 predicted actions</td>
+                <td>Action chunk size</td>
+              </tr>
+              <tr>
+                <td>Observation History Steps</td>
+                <td>2</td>
+                <td>Context window for conditioning</td>
+              </tr>
+              <tr>
+                <td>Executed Actions per Plan</td>
+                <td>2</td>
+                <td>n_action_steps = 2</td>
+              </tr>
+              <tr>
+                <td>Conditioning Dimension</td>
+                <td>256</td>
+                <td>Observation/time conditioning</td>
+              </tr>
+              <tr>
+                <td>Time Embedding Dimension</td>
+                <td>128</td>
+                <td>Temporal encoding</td>
+              </tr>
+              <tr>
+                <td>Base Channels</td>
+                <td>64</td>
+                <td>U-Net width</td>
+              </tr>
+              <tr>
+                <td>Trainable Parameters</td>
+                <td>~1.14M</td>
+                <td>Approximate model size</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <figure class="media-figure top-gap">
+          <img
+            src="Screenshot 2026-03-20 at 8.59.00 PM.png"
+            alt="Temporal behavior cloning setup and model architecture parameter table">
+          <figcaption>Detailed setup and architecture parameters used in our final model.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="evaluation" class="section">
+      <div class="container card">
+        <h2>Evaluation Results</h2>
+        <p>
+          We prioritize rollout success metrics over loss-only comparisons. Our project criterion for a "good"
+          result is a success rate of at least 30%.
+        </p>
+        <p>
+          In the main 50-trial evaluation run, Temporal BC achieved 15 successes and 35 failures (30.0%),
+          meeting this threshold, while the diffusion baseline remained below it.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th>Split</th>
+                <th>Episodes</th>
+                <th>Successes</th>
+                <th>Success Rate</th>
+                <th>Avg Episode Length</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Temporal BC (06c)</td>
+                <td>50-trial eval</td>
+                <td>50</td>
+                <td>15</td>
+                <td>30.0%</td>
+                <td>~500 (many timeout failures)</td>
+              </tr>
+              <tr>
+                <td>Diffusion Policy (baseline)</td>
+                <td>Pilot runs</td>
+                <td>50</td>
+                <td>9</td>
+                <td>18.0%</td>
+                <td>468</td>
+              </tr>
+              <tr>
+                <td>Temporal BC (06c)</td>
+                <td>Additional checkpoints</td>
+                <td>20</td>
+                <td>8</td>
+                <td>40.0%</td>
+                <td>396.9</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid-2 top-gap">
+          <figure class="media-figure">
+            <img
+              src="results-log-success.png"
+              alt="Terminal log snippet highlighting successful cabinet-opening episodes">
+            <figcaption>Success log example: rollout trace with successful cabinet-opening episodes.</figcaption>
+          </figure>
+          <figure class="media-figure">
+            <img
+              src="results-log-50-trials.png"
+              alt="Terminal log from 50-trial experiment dominated by failure episodes">
+            <figcaption>Failure-heavy log example from the 50-trial run (15 success, 35 fail).</figcaption>
+          </figure>
+        </div>
+        <div class="top-gap">
+          <div class="grid-2">
+            <figure class="media-figure">
+              <img
+                src="success-example-cabinet-open.png"
+                alt="Successful rollout frame showing the robot opening a cabinet door">
+              <figcaption>Successful rollout example A: robot achieves cabinet-door opening.</figcaption>
+            </figure>
+            <figure class="media-figure">
+              <img
+                src="success-example-cabinet-open-2.png"
+                alt="Second successful rollout frame showing the cabinet door opened">
+              <figcaption>Successful rollout example B: policy opens a cabinet door in a different scene.</figcaption>
+            </figure>
+          </div>
+        </div>
+        <div class="top-gap">
+          <figure class="media-figure">
+            <img
+              src="results-chart-50-trials.png"
+              alt="Bar chart for 50-trial experiment with 15 successes and 35 failures">
+            <figcaption>Success/failure breakdown for the 50-trial experiment (30.0% success).</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section id="lessons" class="section">
+      <div class="container card">
+        <h2>Failure Analysis / Lessons Learned</h2>
+        <p>
+          Diffusion policy was our first approach but proved too slow and costly to iterate on, and training
+          improvements did not reliably translate to better rollouts. Switching to Temporal BC with a 1D U-Net
+          gave faster iteration and more stable optimization for low-dimensional state-action modeling.
+        </p>
+        <p>
+          Even with Temporal BC, overfitting appeared early on the 107-demo dataset: train loss could keep
+          improving while validation/rollout performance plateaued. We learned to use stronger checkpoint
+          discipline, smaller or more regularized models, and rollout success as the primary model-selection signal.
+        </p>
+        <p>
+          Engineering issues also affected outcomes (Colab resets, temporary checkpoint loss, incomplete asset
+          downloads), reinforcing the need for reproducible commands, persistent storage, and deterministic eval.
+        </p>
+        <div class="grid-2 top-gap">
+          <figure class="media-figure">
+            <img
+              src="failure-example-1.png"
+              alt="Failure rollout example where the robot arm misses stable cabinet interaction">
+            <figcaption>Failure example 1: unstable alignment near the cabinet interaction region.</figcaption>
+          </figure>
+          <figure class="media-figure">
+            <img
+              src="failure-example-2.png"
+              alt="Failure rollout example where the arm pose does not produce a successful open action">
+            <figcaption>Failure example 2: arm reaches a poor pose and does not complete opening.</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section id="demo" class="section">
+      <div class="container card">
+        <h2>Demo Video</h2>
+        <p>
+          Demonstration rollout from our final policy.
+        </p>
+        <div class="video-frame">
+          <video controls preload="metadata">
+            <source src="video188.mov" type="video/quicktime">
+            Your browser does not support embedded video playback for this format.
+          </video>
+        </div>
+      </div>
+    </section>
+
+    <section id="repro" class="section">
+      <div class="container card">
+        <h2>Reproducibility</h2>
+        <p>
+          We use fixed seeds, explicit checkpoint directories, and consistent evaluation splits across runs.
+        </p>
+        <h3>Run Commands</h3>
+        <pre><code># Train
+python train.py \
+  --config configs/temporal_bc_06c.yaml \
+  --seed 0 \
+  --exp-name temporal_bc_06c_final
+
+# Evaluate
+python eval.py \
+  --checkpoint checkpoints/temporal_bc_06c_final/best.pt \
+  --episodes 50 \
+  --seed 0</code></pre>
+      </div>
+    </section>
+
+    <section id="team" class="section">
+      <div class="container card">
+        <h2>Team Contributions</h2>
+        <p>
+          <strong>Anshul Aravind:</strong> Colab environment setup, dataset/asset pipeline, core training runs, rollout
+          video generation, runtime/dependency debugging, and report writing/editing.<br>
+          <strong>Jeffrey Liu:</strong> Model/config tuning, experiment comparison, cross-split evaluation analysis,
+          methodology refinement, failure analysis, and report writing/editing.
+        </p>
+        <p>Final decisions and reported conclusions were made collaboratively after joint review of results.</p>
+      </div>
+    </section>
+
+    <section id="credits" class="section">
+      <div class="container card">
+        <h2>Credits / Attribution</h2>
+        <p>
+          We thank the COM SCI 188 course staff for project support and the RoboCasa/OpenCabinet benchmark and tooling
+          used in this work. This site summarizes Team 23 final methodology, results, and reflections.
+        </p>
+        <p>Attribution: We built on course-provided resources and used AI tools for drafting/debugging support, while Team 23 implemented the data pipeline, Temporal BC + 1D U-Net training/evaluation workflow, experiment analysis, and final report/website content.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <p>COM SCI 188 · Winter 2026 · Team 23</p>
+    </div>
+  </footer>
+</body>
+</html>
