@@ -236,7 +236,7 @@ python 07_evaluate_policy.py \
   --num_rollouts 20 \
   --split pretrain
 
-python 08_visualize_policy_rollout.py \
+mjpython 08_visualize_policy_rollout.py \
   --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt \
   --num_episodes 1 \
   --max_steps 500
