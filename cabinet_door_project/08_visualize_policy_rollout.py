@@ -87,6 +87,19 @@ def _collect_debug_metrics(extractor, env, action, near_handle_threshold):
     }
 
 
+def _apply_forced_layout_style(env, layout_id, style_id):
+    """Optionally force a specific kitchen layout/style for the next reset."""
+    if layout_id is None and style_id is None:
+        return
+    if (layout_id is None) != (style_id is None):
+        raise ValueError("Both --layout_id and --style_id must be set together.")
+
+    ep_meta = env.get_ep_meta()
+    ep_meta["layout_id"] = int(layout_id)
+    ep_meta["style_id"] = int(style_id)
+    env.set_ep_meta(ep_meta)
+
+
 def run_onscreen(policy, args):
     """Run policy with interactive viewer window."""
     env = robosuite.make(
@@ -107,6 +120,7 @@ def run_onscreen(policy, args):
     extractor = OnlineHandleFeatureExtractor()
     for ep in range(args.num_episodes):
         print(f"\n--- Episode {ep + 1}/{args.num_episodes} ---")
+        _apply_forced_layout_style(env, args.layout_id, args.style_id)
         obs = env.reset()
         policy.reset()
 
@@ -208,14 +222,16 @@ def run_offscreen(policy, args):
 
     for ep in range(args.num_episodes):
         print(f"\n--- Episode {ep + 1}/{args.num_episodes} ---")
+        ep_seed = None if args.seed is None else (int(args.seed) + ep)
         env = create_env(
             env_name="OpenCabinet",
             render_onscreen=False,
-            seed=args.seed + ep,
+            seed=ep_seed,
             camera_widths=cam_w,
             camera_heights=cam_h,
         )
 
+        _apply_forced_layout_style(env, args.layout_id, args.style_id)
         obs = env.reset()
         policy.reset()
 
@@ -360,8 +376,8 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed for environment layout/style selection",
+        default=None,
+        help="Random seed for environment layout/style selection (default: unseeded random)",
     )
     parser.add_argument(
         "--success_threshold",
@@ -386,7 +402,21 @@ def main():
         default=0.06,
         help="Distance threshold (m) for near-handle debug stats",
     )
+    parser.add_argument(
+        "--layout_id",
+        type=int,
+        default=None,
+        help="Force a specific kitchen layout id (requires --style_id)",
+    )
+    parser.add_argument(
+        "--style_id",
+        type=int,
+        default=None,
+        help="Force a specific kitchen style id (requires --layout_id)",
+    )
     args = parser.parse_args()
+    if (args.layout_id is None) != (args.style_id is None):
+        parser.error("--layout_id and --style_id must be provided together")
 
     print("=" * 60)
     print("  OpenCabinet - Policy Rollout Visualizer")
@@ -423,6 +453,9 @@ def main():
     print(f"Mode:       {mode}")
     print(f"Episodes:   {args.num_episodes}")
     print(f"Max steps:  {args.max_steps}")
+    print(f"Seed:       {'random (unseeded)' if args.seed is None else args.seed}")
+    if args.layout_id is not None and args.style_id is not None:
+        print(f"Scene:      forced layout={args.layout_id}, style={args.style_id}")
     if args.offscreen:
         print(f"Output:     {args.video_path}")
 

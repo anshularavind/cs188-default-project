@@ -1,396 +1,243 @@
-# Cabinet Door Opening Robot - CS 188 Starter Project
+# Cabinet Door Project - Current Working Guide
 
-### Disclaimer
+This README reflects the **current codebase** and the policy setup we finalized:
 
-This project was designed for CS 188 - Intro to Robotics as a template starter project. If you have any issues with the codebase, please email me at holdengs @ cs.ucla.edu!
+- Primary training script: `06c_train_temporal_unet_bc_policy.py`
+- Primary config (best run setup): `configs/temporal_unet_bc_old_exact_400_policy3.yaml`
+- Primary checkpoint names: `best_policy_3.pt`, `final_policy_3.pt`
+- Success rule in eval/visualization: **any one cabinet door open** (default threshold `0.10`)
 
-## Overview
+## Recommended Workflow (Local)
 
-In this project you will build a robot that learns to open kitchen cabinet doors
-using **RoboCasa365**, a large-scale simulation benchmark for everyday robot
-tasks. You will progress from understanding the simulation environment, to
-collecting demonstrations, to training a neural-network policy that controls the
-robot autonomously.
-
-### What you will learn
-
-1. How robotic manipulation environments are structured (MuJoCo + robosuite + RoboCasa)
-2. How the `OpenCabinet` task works -- sensors, actions, success criteria
-3. How to collect and use demonstration datasets (human + MimicGen)
-4. How to train a behavior-cloning policy from demonstrations
-5. How to evaluate your trained policy in simulation
-
-### The robot
-
-We use the **PandaOmron** mobile manipulator -- a Franka Panda 7-DOF arm
-mounted on an Omron wheeled base with a torso lift joint. This is the default
-and best-supported robot in RoboCasa.
-
----
-
-## Installation
-
-Run the install script (works on **macOS** and **WSL/Linux**):
+From repo root:
 
 ```bash
 ./install.sh
-```
-
-This will:
-- Create a Python virtual environment (`.venv`)
-- Clone and install robosuite and robocasa
-- Install all Python dependencies (PyTorch, numpy, matplotlib, etc.)
-- Download RoboCasa kitchen assets (~10 GB)
-
-After installation, activate the environment:
-
-```bash
 source .venv/bin/activate
-```
-
-Then verify everything works:
-
-```bash
 cd cabinet_door_project
 python 00_verify_installation.py
 ```
 
-> **macOS note:** Scripts that open a rendering window (03, 05) require
-> `mjpython` instead of `python`. The install script will remind you of this.
-
-### Colab Setup
-
-You can run this project on Google Colab (GPU runtime recommended) without
-creating a local `.venv`.
-
-```bash
-# In a Colab cell
-REPO_URL="<your-repo-url>"
-REPO_DIR="/content/cs188-default-project"
-!git clone "$REPO_URL" "$REPO_DIR"
-%cd $REPO_DIR
-!python cabinet_door_project/99_colab_setup.py --verify
-```
-
-Then run the project scripts from `cabinet_door_project/` as usual:
-
-```bash
-%cd cabinet_door_project
-!python 04_download_dataset.py
-!python 05b_augment_handle_data.py
-!python 06_train_policy.py --config configs/diffusion_policy.yaml
-```
-
-One-cell quickstart (copy/paste into a single Colab cell):
-
-```python
-# ==== Edit this first ====
-REPO_URL = "<your-repo-url>"
-REPO_DIR = "/content/cs188-default-project"
-
-# ==== Bootstrap ====
-!git clone {REPO_URL} {REPO_DIR}
-%cd $REPO_DIR
-!python cabinet_door_project/99_colab_setup.py --verify
-%cd cabinet_door_project
-
-# ==== Data + augmentation ====
-!python 04_download_dataset.py
-!python 05b_augment_handle_data.py
-
-# ==== Quick sanity train (faster) ====
-!python 06_train_policy.py --config configs/diffusion_policy.yaml --epochs 5 --max_episodes 40 --batch_size 32
-
-# ==== Evaluate + rollout video ====
-!python 07_evaluate_policy.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt --num_rollouts 10
-!python 08_visualize_policy_rollout.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt --offscreen --video_path /tmp/policy_rollout.mp4
-```
-
----
-
-## Project Structure
-
-```
-cabinet_door_project/
-  00_verify_installation.py      # Check that everything is installed correctly
-  01_explore_environment.py      # Create the OpenCabinet env, inspect observations/actions
-  02_random_rollouts.py          # Run random actions, save video, understand the task
-  03_teleop_collect_demos.py     # Teleoperate the robot to collect your own demonstrations
-  04_download_dataset.py         # Download the pre-collected OpenCabinet dataset
-  05_playback_demonstrations.py  # Play back demonstrations to see expert behavior
-  06_train_policy.py             # Train a low-dim diffusion policy (1D Conv U-Net)
-  07_evaluate_policy.py          # Evaluate your trained policy in simulation
-  08_visualize_policy_rollout.py # Visualize a rollout of your policy in RoboCasa
-  99_colab_setup.py              # Install deps / bootstrap in Google Colab
-  runtime_setup.py               # Runtime backend + device selection helpers
-  configs/
-    diffusion_policy.yaml        # Training hyperparameters
-  notebook.ipynb                 # Interactive Jupyter notebook companion
-install.sh                       # Installation script (macOS + WSL/Linux)
-README.md                        # This file
-```
-
----
-
-## Step-by-Step Guide
-
-### Step 0: Verify Installation
-
-```bash
-python 00_verify_installation.py
-```
-
-This checks that MuJoCo, robosuite, RoboCasa, and all dependencies are
-correctly installed and that the `OpenCabinet` environment can be created.
-
-### Step 1: Explore the Environment
-
-```bash
-python 01_explore_environment.py
-```
-
-This script creates the `OpenCabinet` environment and prints detailed
-information about:
-- **Observation space**: what the robot sees (camera images, joint positions,
-  gripper state, base pose)
-- **Action space**: what the robot can do (arm movement, gripper open/close,
-  base motion, control mode)
-- **Task description**: the natural language instruction for the episode
-- **Success criteria**: how the environment determines task completion
-
-### Step 2: Random Rollouts
-
-```bash
-python 02_random_rollouts.py
-```
-
-Runs the robot with random actions to see what happens (spoiler: nothing
-useful, but it helps you understand the action space). Saves a video to
-`/tmp/cabinet_random_rollouts.mp4`.
-
-### Step 3: Teleoperate and Collect Demonstrations
-
-```bash
-# Mac users: use mjpython instead of python
-python 03_teleop_collect_demos.py
-```
-
-Control the robot yourself using the keyboard to open cabinet doors. This
-gives you intuition for the task difficulty and generates demonstration data.
-
-**Keyboard controls:**
-| Key | Action |
-|-----|--------|
-| Ctrl+q | Reset simulation |
-| spacebar | Toggle gripper (open/close) |
-| up-right-down-left | Move horizontally in x-y plane |
-| .-; | Move vertically |
-| o-p | Rotate (yaw) |
-| y-h | Rotate (pitch) |
-| e-r | Rotate (roll) |
-| b | Toggle arm/base mode (if applicable) |
-| s | Switch active arm (if multi-armed robot) |
-| = | Switch active robot (if multi-robot environment) |              
-
-### Step 4: Download Pre-collected Dataset
+If verify passes, run the actual training pipeline:
 
 ```bash
 python 04_download_dataset.py
+python 05b_augment_handle_data.py
+python 06c_train_temporal_unet_bc_policy.py --config configs/temporal_unet_bc_old_exact_400_policy3.yaml
 ```
 
-Downloads the official OpenCabinet demonstration dataset from the RoboCasa
-servers. This includes both human demonstrations and MimicGen-expanded data
-across diverse kitchen scenes.
+This writes checkpoints to:
 
-### Step 5: Play Back Demonstrations
+- `/tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt`
+- `/tmp/cabinet_temporal_unet_bc_ckpts/final_policy_3.pt`
+
+In our recorded `best_policy_3` run, the best checkpoint was saved at **epoch 335** with
+training loss **0.1012389**.
+
+## How To Train The Correct Model (`06c` + Best Config)
+
+Use exactly:
 
 ```bash
-python 05_playback_demonstrations.py
+python 06c_train_temporal_unet_bc_policy.py --config configs/temporal_unet_bc_old_exact_400_policy3.yaml
 ```
 
-Visualize the downloaded demonstrations to see how an expert opens cabinet
-doors. This is the data your policy will learn from.
+### What this config does
 
-### Step 6: Train a Policy
+- Temporal BC with 1D U-Net (non-staged)
+- Uses **augmented dataset** (`include_augmented=true`, `require_augmented=true`)
+- 400 epochs, batch size 512
+- 11D low-dimensional state, action horizon 16
+- Composite loss:
+  \[
+  \mathcal{L} = \mathcal{L}_{MSE} + 0.25\,\mathcal{L}_{L1} + 0.15\,\mathcal{L}_{vel}
+  \]
+
+Where velocity loss compares temporal differences:
+\(\Delta a_t = a_t - a_{t-1}\).
+
+## Evaluate Policy
 
 ```bash
-python 06_train_policy.py
+python 07_evaluate_policy.py \
+  --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt \
+  --num_rollouts 20 \
+  --split pretrain
 ```
 
-Trains a low-dimensional diffusion policy (1D Conv U-Net) on state-action
-pairs from the demonstration data.
-If you ran `05b_augment_handle_data.py`, the trainer auto-detects those
-augmented parquet files and includes the extra handle/door features.
+Notes:
 
-For larger-scale / production training, you can also use the official repos:
+- `--split pretrain` = in-distribution scenes
+- `--split target` = held-out / harder generalization scenes
+- `--seed` now defaults to `None` (randomized layout/style sequence each run)
+- pass `--seed 123` if you want deterministic repeatability
+
+You can loosen/tighten success threshold:
 
 ```bash
-# Diffusion Policy (recommended for single-task)
-git clone https://github.com/robocasa-benchmark/diffusion_policy
-cd diffusion_policy && pip install -e .
-python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
+--success_threshold 0.23
 ```
 
-Configuration is in `cabinet_door_project/configs/diffusion_policy.yaml`.
+## Visualize Policy
 
-### Step 7: Evaluate Your Policy
+### On-screen
 
 ```bash
-python 07_evaluate_policy.py --checkpoint path/to/checkpoint.pt
+python 08_visualize_policy_rollout.py \
+  --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt \
+  --num_episodes 1 \
+  --max_steps 500
 ```
 
-Runs your trained policy in the simulation environment and reports success
-rate across multiple episodes and kitchen scenes.
+### Off-screen video
 
----
-
-## Key Concepts
-
-### The OpenCabinet Task
-
-- **Goal**: Open a kitchen cabinet door
-- **Fixture**: `HingeCabinet` (a cabinet with hinged doors)
-- **Initial state**: Cabinet door is closed; robot is positioned nearby
-- **Success (evaluation script)**: any one target door reaches open threshold
-- **Horizon**: 500 timesteps at 20 Hz control frequency (25 seconds)
-- **Scene variety**: 2,500+ kitchen layouts/styles for generalization
-
-### Observation Space (PandaOmron)
-
-| Key | Shape | Description |
-|-----|-------|-------------|
-| `robot0_agentview_left_image` | (256, 256, 3) | Left shoulder camera |
-| `robot0_agentview_right_image` | (256, 256, 3) | Right shoulder camera |
-| `robot0_eye_in_hand_image` | (256, 256, 3) | Wrist-mounted camera |
-| `robot0_gripper_qpos` | (2,) | Gripper finger positions |
-| `robot0_base_pos` | (3,) | Base position (x, y, z) |
-| `robot0_base_quat` | (4,) | Base orientation quaternion |
-| `robot0_base_to_eef_pos` | (3,) | End-effector pos relative to base |
-| `robot0_base_to_eef_quat` | (4,) | End-effector orientation relative to base |
-
-### Action Space (PandaOmron)
-
-| Key | Dim | Description |
-|-----|-----|-------------|
-| `end_effector_position` | 3 | Delta (dx, dy, dz) for the end-effector |
-| `end_effector_rotation` | 3 | Delta rotation (axis-angle) |
-| `gripper_close` | 1 | 0 = open, 1 = close |
-| `base_motion` | 4 | (forward, side, yaw, torso) |
-| `control_mode` | 1 | 0 = arm control, 1 = base control |
-
-### Dataset Format (LeRobot)
-
-Datasets are stored in LeRobot format:
-```
-dataset/
-  meta/           # Episode metadata (task descriptions, camera info)
-  videos/         # MP4 videos from each camera
-  data/           # Parquet files with actions, states, rewards
-  extras/         # Per-episode metadata
+```bash
+python 08_visualize_policy_rollout.py \
+  --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt \
+  --offscreen \
+  --video_path /tmp/policy_rollout.mp4 \
+  --num_episodes 1 \
+  --max_steps 500
 ```
 
----
+### Force a specific layout/style
 
-## Architecture Diagram
-
-```
-                    RoboCasa Stack
-                    ==============
-
-  +-------------------+     +-------------------+
-  |   Kitchen Scene   |     |   OpenCabinet     |
-  |  (2500+ layouts)  |     |   (Task Logic)    |
-  +--------+----------+     +--------+----------+
-           |                         |
-           v                         v
-  +------------------------------------------------+
-  |              Kitchen Base Class                 |
-  |  - Fixture management (cabinets, fridges, etc)  |
-  |  - Object placement (bowls, cups, etc)          |
-  |  - Robot positioning                            |
-  +------------------------+-----------------------+
-                           |
-                           v
-  +------------------------------------------------+
-  |              robosuite (Backend)                |
-  |  - MuJoCo physics simulation                   |
-  |  - Robot models (PandaOmron, GR1, Spot, ...)   |
-  |  - Controller framework                        |
-  +------------------------+-----------------------+
-                           |
-                           v
-  +------------------------------------------------+
-  |              MuJoCo 3.3.1 (Physics)            |
-  |  - Contact dynamics, rendering, sensors        |
-  +------------------------------------------------+
+```bash
+python 08_visualize_policy_rollout.py \
+  --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt \
+  --layout_id 45 \
+  --style_id 47
 ```
 
----
+Important:
 
-## Research Directions
+- `--layout_id` and `--style_id` must be passed together.
+- Some layout/style combinations are invalid and can fail environment placement.
+- If that happens, use a known valid pair from your eval logs.
 
-The low-dim diffusion baseline in `06_train_policy.py` is intentionally
-compact and CPU/GPU-friendly. Here are three fun directions to improve it:
+## Method Summary (Project)
 
-### Stronger Diffusion Policy
+1. Download OpenCabinet demonstrations (`04_download_dataset.py`).
+2. Add handle-centric augmentation columns (`05b_augment_handle_data.py`).
+3. Train non-staged temporal U-Net BC (`06c_train_temporal_unet_bc_policy.py`).
+4. Save best and final checkpoints based on monitored loss.
+5. Evaluate and visualize with one-door-open success criterion.
 
-Scale the current diffusion setup (larger U-Net, more diffusion steps, and
-better normalization / schedulers) for higher success rates.
-The core loop is to corrupt ground-truth actions with Gaussian noise,
-train the network to predict that noise conditioned on the current state, and
-at inference iteratively denoise from pure noise to produce an action. This
-properly handles multi-modal demonstrations (e.g., approaching the handle from
-the left vs. right) that MSE loss averages into useless mean actions.
-See [Chi et al., 2023](https://diffusion-policy.cs.columbia.edu/) for the
-full approach.
+## File-by-File Guide
 
-### DAgger (Online Correction)
+### Repo root
 
-Script 03 already provides keyboard teleoperation. I have it set up with a DAgger mode that may or may not be kinda buggy. Use it to close the loop:
-train a policy, roll it out, then have a human take over and correct the robot
-whenever it fails. Aggregate these corrections into the training set and
-retrain. This directly attacks distribution shift — the fundamental reason
-offline BC degrades at test time — by collecting data in the states the policy
-actually visits. Even one or two rounds of DAgger can dramatically improve
-robustness. See [Ross et al., 2011](https://arxiv.org/abs/1011.0686).
+- `README.md`: This document.
+- `install.sh`: Local install/bootstrap script (venv, deps, assets flow).
+- `pyproject.toml`: Python project metadata.
+- `.python-version`: Python version hint.
+- `main.py`: Minimal entry script.
+- `.gitignore`: Git ignore rules (important for checkpoints/assets).
+- `modelarch.txt`: Scratch file for architecture notes/diagrams.
+- `robosuite/`: robosuite source checkout.
+- `robocasa/`: robocasa source checkout.
 
-### Action Chunking
+### `cabinet_door_project/`
 
-Instead of predicting one action per timestep, predict the next *K* actions at
-once and execute them open-loop before re-planning. This is the key idea behind
-ACT ([Zhao et al., 2023](https://arxiv.org/abs/2304.13705)) and directly fixes
-the jerky, temporally incoherent behavior of single-step BC. Fair warning, though, this will probably require a more sophisticated model (Transformer, Diffusion or other) to provide real benefits. Implementation is
-straightforward: widen the output head to `K * action_dim`, train with the same
-MSE loss over the full chunk, and add a small FIFO buffer at inference. Try
-sweeping K = 4, 8, 16 and compare smoothness and success rate.
+- `00_verify_installation.py`: End-to-end environment/dependency sanity check.
+- `01_explore_environment.py`: Prints observation/action/task structure for OpenCabinet.
+- `02_random_rollouts.py`: Random-policy rollouts for quick environment sanity.
+- `03_teleop_collect_demos.py`: Teleoperation script to collect human demos.
+- `04_download_dataset.py`: Downloads the OpenCabinet dataset in LeRobot format.
+- `05_playback_demonstrations.py`: Playback utility for demonstration inspection.
+- `05b_augment_handle_data.py`: Adds augmented handle features to parquet data.
+- `06_train_policy.py`: Diffusion policy trainer (U-Net diffusion baseline).
+- `06b_train_staged_bc_policy.py`: Staged BC trainer (approach/grasp/pull phases).
+- `06c_train_temporal_unet_bc_policy.py`: **Primary trainer** (non-staged temporal U-Net BC).
+- `07_evaluate_policy.py`: Batch evaluation script with per-episode layout/style logging.
+- `08_visualize_policy_rollout.py`: On-screen/off-screen rollout visualizer with debug metrics and optional forced scene ids.
+- `99_colab_setup.py`: Colab bootstrap utility (apt/pip/editable installs, optional assets/dataset/verify).
+- `policy_common.py`: Shared core module:
+  - dataset loader and state construction
+  - 1D conditional U-Net
+  - diffusion scheduler/core
+  - BC/diffusion wrappers
+  - action remap + binarization postprocess
+  - checkpoint loading across policy types
+- `runtime_setup.py`: Rendering backend and torch device selection helpers.
+- `notebook.ipynb`: Multi-cell notebook workflow.
+- `colab_one_cell.ipynb`: Single-cell Colab workflow.
+- `configs/`: YAML config presets.
+- `diffusion_ckpts/`: Local diffusion checkpoint storage (do not commit large files).
+- `MUJOCO_LOG.TXT`: MuJoCo runtime log output.
+- `__pycache__/`: Python bytecode cache.
 
-### Other Ideas
-- Gaussian Mixture Model for output logits. Can ameliorate the MSE multimodality issue.
-- Vision Transformer. Will need a beefier computer to see benefits but definitely can improve policy at scale.
-- Hooking in an existing VLM and experimenting with zero-shot inference.
+### `cabinet_door_project/configs/`
 
----
+- `diffusion_policy.yaml`: Diffusion U-Net baseline config (`06_train_policy.py`).
+- `staged_bc_policy.yaml`: Staged BC config (`06b_train_staged_bc_policy.py`).
+- `temporal_unet_bc_policy.yaml`: 22D working temporal U-Net BC config with val split.
+- `temporal_unet_bc_old_exact.yaml`: Old-exact 11D temporal BC config (`best-policy_2.pt` / `final_policy_2.pt`).
+- `temporal_unet_bc_old_exact_400_policy3.yaml`: **Best-policy-3 training config** (`best_policy_3.pt` / `final_policy_3.pt`).
+
+## Policy Types Supported By Loader
+
+`policy_common.load_policy_wrapper(...)` can load:
+
+- `temporal_unet_bc_lowdim` (06c)
+- `diffusion_unet_lowdim` (06)
+- `staged_bc_handle_pull` (06b)
+- legacy MLP checkpoints
+
+## Colab Notes
+
+Use `99_colab_setup.py` for base install, then run project scripts.
+Kitchen asset download can be large and sometimes flaky; if it fails, rerun asset commands directly.
+Checkpoints under `/tmp` are ephemeral in Colab runtime and should be copied to Drive if needed.
+
+### Minimal Colab sequence
+
+```python
+REPO_DIR = "/content/cs188-default-project"
+%cd /content
+!git clone <your-repo-url> {REPO_DIR}
+%cd {REPO_DIR}
+
+# Base bootstrap (apt + pip + editable installs)
+!python cabinet_door_project/99_colab_setup.py
+
+# Optional but commonly needed for full RoboCasa scenes
+!python robocasa/robocasa/scripts/download_kitchen_assets.py
+!python robocasa/robocasa/scripts/setup_macros.py
+
+%cd {REPO_DIR}/cabinet_door_project
+!python 04_download_dataset.py
+!python 05b_augment_handle_data.py
+!python 06c_train_temporal_unet_bc_policy.py --config configs/temporal_unet_bc_old_exact_400_policy3.yaml
+!python 07_evaluate_policy.py --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt --num_rollouts 20 --split pretrain
+```
 
 ## Troubleshooting
 
-I'll continually update this section as students find bugs in the system. Please, let me know if you encounter issues!
+- `No private macro file found`: run macro setup script from robocasa/robosuite as suggested by warning.
+- `state_dict` key mismatch with `model.` prefix: loader now unwraps legacy prefixed keys.
+- Eval scene sequence repeats: omit `--seed` or set different seed.
+- Visualization crash with forced scene ids: choose a valid layout/style pair.
+- Push rejected due large checkpoint file: remove checkpoint from history or keep it out of git.
 
-| Problem | Solution |
-|---------|----------|
-| `MuJoCo version must be 3.3.1` | `pip install mujoco==3.3.1` |
-| `numpy version must be 2.2.5` | `pip install numpy==2.2.5` |
-| Rendering crashes on Mac | Use `mjpython` instead of `python` |
-| `GLFW error` on headless server | Set `export MUJOCO_GL=egl` or `osmesa` |
-| Out of GPU memory during training | Reduce batch size in `configs/diffusion_policy.yaml` |
-| Kitchen assets not found | Run `python -m robocasa.scripts.download_kitchen_assets` |
+## Quick Command Block (Copy/Paste)
 
----
+```bash
+source .venv/bin/activate
+cd /Users/anshularavind/cs188-default-project/cabinet_door_project
 
-## References
+python 00_verify_installation.py
+python 04_download_dataset.py
+python 05b_augment_handle_data.py
+python 06c_train_temporal_unet_bc_policy.py --config configs/temporal_unet_bc_old_exact_400_policy3.yaml
 
-- [RoboCasa Paper & Website](https://robocasa.ai/)
-- [RoboCasa GitHub](https://github.com/robocasa/robocasa)
-- [robosuite Documentation](https://robosuite.ai/)
-- [Diffusion Policy Paper](https://diffusion-policy.cs.columbia.edu/)
-- [MuJoCo Documentation](https://mujoco.readthedocs.io/)
-- [LeRobot Dataset Format](https://github.com/huggingface/lerobot)
+python 07_evaluate_policy.py \
+  --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt \
+  --num_rollouts 20 \
+  --split pretrain
+
+python 08_visualize_policy_rollout.py \
+  --checkpoint /tmp/cabinet_temporal_unet_bc_ckpts/best_policy_3.pt \
+  --num_episodes 1 \
+  --max_steps 500
+```

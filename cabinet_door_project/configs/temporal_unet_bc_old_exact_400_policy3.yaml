@@ -1,0 +1,41 @@
+seed: 42
+epochs: 400
+batch_size: 512
+learning_rate: 0.0002
+weight_decay: 0.000001
+num_workers: 0
+grad_clip: 1.0
+log_every: 10
+checkpoint_dir: /tmp/cabinet_temporal_unet_bc_ckpts
+best_checkpoint_name: best_policy_3.pt
+final_checkpoint_name: final_policy_3.pt
+max_episodes: null
+
+include_augmented: true
+require_augmented: true
+include_all_lowdim: true
+use_observation_state: false
+state_keys_override: null
+expected_state_dim: 11
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 2
+steps_per_epoch: 40
+episode_burn_in_steps: 0
+val_split_ratio: 0.0
+min_val_episodes: 0
+early_stopping_patience: 0
+early_stopping_min_delta: 0.0
+use_amp: false
+
+base_channels: 64
+channel_mults: [1, 2]
+num_res_blocks: 1
+time_emb_dim: 128
+cond_dim: 256
+dropout: 0.0
+
+l1_weight: 0.25
+velocity_weight: 0.15
+

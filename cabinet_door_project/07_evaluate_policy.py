@@ -136,7 +136,12 @@ def main():
         default=None,
         help="Path to save evaluation video (optional)",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (default: unseeded random layout/style sampling each run)",
+    )
     parser.add_argument(
         "--success_threshold",
         type=float,
@@ -157,6 +162,7 @@ def main():
 
     device = select_torch_device()
     print(f"Device: {device}")
+    print(f"Seed: {'random (unseeded)' if args.seed is None else args.seed}")
 
     policy, info, ckpt = load_policy_wrapper(args.checkpoint, device)
     print(f"Loaded policy from: {args.checkpoint}")
