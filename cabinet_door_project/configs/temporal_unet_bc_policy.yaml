@@ -1,8 +1,8 @@
 seed: 42
-epochs: 100
-batch_size: 128
-learning_rate: 0.001
-weight_decay: 0.000001
+epochs: 450
+batch_size: 64
+learning_rate: 0.00008
+weight_decay: 0.00001
 num_workers: 0
 grad_clip: 1.0
 log_every: 1
@@ -35,7 +35,7 @@ channel_mults: [1, 2]
 num_res_blocks: 1
 time_emb_dim: 128
 cond_dim: 256
-dropout: 0.0
+dropout: 0.12
 
 l1_weight: 0.10
 velocity_weight: 0.10
